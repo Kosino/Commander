@@ -1,0 +1,15 @@
+---
+description: Rules engine a herní logika — rulebook + Arena UX
+globs: web/lib/engine/**/*
+alwaysApply: false
+---
+
+# MTG engine
+
+- Source of truth: `docs/rulebook.md` (nadřazené) + `docs/MagicCompRules_*.txt` (CR).
+- Herní pravidla se nemění libovolně; implementace musí sedět s CR/rulebookem.
+- **MTG Arena (GRE / klient):** konzultovat UX a herní ošetření (priority prompt, targeting highlight, combat declare/confirm, stack, SBA choices, mana tap během castu). CR rozhoduje *co* platí; Arena inspiruje *jak* to hráči nabídnout.
+- Nová pravidla / rozšíření docs: jen když to herní modul opravdu potřebuje.
+- Neinventovat keyword/SBA/priority/combat „odhadem“ — ověřit grepem v CR nebo rulebooku.
+- Velký CR soubor nečíst celý; cílit na sekce (117, 506–510, 601, 704, 903).
+- Diff-first; neduplikovat celé soubory do chatu.

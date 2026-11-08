@@ -1,0 +1,24 @@
+---
+description: Pravidla pro subagenty a workstreamy — MTG client
+alwaysApply: true
+---
+
+# Agenti — MTG client
+
+## Workstream
+
+- Jeden worker na workstream; **resume** místo nového agenta se stejným checkoutem.
+- Parallel / explore agent: OK při **neznámém povrchu** nebo širokém hledání; trivial grep/read dělá hlavní agent.
+- Cloud agent v tomto projektu **povoleno** (lokální je default).
+
+## Prompt a výstup subagenta
+
+- Prompt: cíl + relevantní cesty + max ~5 bullet očekávaný výstup.
+- Nežádat „vrať celý soubor“ / dump stromu; stačí zjištění + cesty.
+- Best-of-n / multi-model experimenty jen na výslovnou žádost.
+
+## Co nesahat bez důvodu
+
+- `data/oracle-cards.jsonl.gz` — nečíst celý; jen přes `search_cards.py` / API.
+- `docs/MagicCompRules_*.txt` — jen grep / úsek podle čísla pravidla.
+- Cizí projekty (Hvězdný Přístav, EDH-Social, Expo) — mimo scope.

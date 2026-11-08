@@ -1,0 +1,33 @@
+---
+description: Úspora tokenů — MTG client (vždy)
+alwaysApply: true
+---
+
+# Úspora tokenů — MTG client
+
+Kdy: vždy při vývoji tohoto projektu. Výjimka jen když Honza výslovně řekne jinak.
+
+## Media a testování
+
+- Negenerovat videa, screenshoty ani walkthrough artefakty při vývoji a iteracích.
+- RecordScreen / GenerateImage / UI demo jen na výslovnou žádost.
+- Default ověření: terminal (`tsc`, lint, testy, logy, krátký Python search) nebo krátký text výsledku.
+- Respektovat `/no-test`; jinak minimální CLI check, ne vizuální důkaz.
+- Pokud `npm`/`node` není v PATH: jednou to napsat a neopakovat neúspěšné retry.
+
+## Dokumenty a artefakty
+
+- Nevytvářet reporty, audity, canvas ani archivní shrnutí „pro jistotu“.
+- `docs/` nerozšiřovat „pro jistotu“. Nový doc jen jako výslovný deliverable, nebo když herní modul potřebuje nový podklad k pravidlům.
+- Stav úkolů = Cursor todos (ne `notes.md`).
+- Chat = výsledek; bez duplicit vůči `docs/project-context.md`.
+
+## Provoz
+
+- Krátké odpovědi (1–3 věty + nutný detail); neopakovat zadání.
+- Cílené čtení (grep / úseky); víc kontextu jen když je to potřeba pro správnost.
+- Diff-first: v chatu ne celé soubory, jen krátký popis změny nebo malý úsek.
+- Nepollovat completion; status check jen před tvrzením „ještě běží“.
+- Plány: rovnou implementace; krátký **inline plan** OK u větší/nejasné práce. Plný Plan mode jen když Honza požádá nebo je to výrazně lepší.
+- Bez Try Live / embed videí / canvas dashboardů, pokud Honza nepožádá.
+- Stack a cesty držet v `docs/project-context.md` (krátký); nehádat cesty z paměti jiného projektu.

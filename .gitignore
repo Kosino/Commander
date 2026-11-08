@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+web/node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Next.js / build
+web/.next/
+web/out/
+web/dist/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
+
+# Local runtime / persistence
+.data/
+web/.data/
+*.log
+npm-debug.log*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Large / generated card data (keep locally; do not push)
+data/oracle-cards.jsonl.gz
+data/*.jsonl
+data/*.jsonl.gz
+
+# Migration archives
+*.tar.gz
+
+# Cursor local (keep .cursor/rules tracked)
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
