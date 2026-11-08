@@ -10,6 +10,7 @@ import {
   effectiveToughness,
   PendingChoice,
 } from './types';
+import { deathDestination } from './replacement';
 import { fireDiesFromSnapshot } from './triggers';
 import { clonePlayers, findCard, moveCard } from './zones';
 
@@ -189,12 +190,17 @@ export function applyStateBasedActionsOnce(state: GameState): { state: GameState
         }
       }
     }
-    const moved = moveCard(next, id, 'graveyard');
+    const dest = deathDestination(next, id);
+    const moved = moveCard(next, id, dest);
     next = moved.state;
     performed = true;
   }
   if (diedSnap.length > 0) {
-    if (diedSnap.some((d) => d.wasCreature)) next.creatureDiedThisTurn = true;
+    const creatureDeaths = diedSnap.filter((d) => d.wasCreature).length;
+    if (creatureDeaths > 0) {
+      next.creatureDiedThisTurn = true;
+      next.creaturesDiedThisTurn = (next.creaturesDiedThisTurn || 0) + creatureDeaths;
+    }
     next = fireDiesFromSnapshot(
       next,
       diedSnap.map((d) => ({
@@ -309,16 +315,24 @@ export function applyStateBasedActionsOnce(state: GameState): { state: GameState
     return { state: next, performed };
   }
 
-  // 704.6d — commander put into GY/exile since last SBA → owner may put in command zone
+  // 704.6d / 903.9 — commander put into GY/exile/hand/library → owner may put in command zone
   for (const p of next.players) {
-    for (const c of [...p.graveyard, ...p.exile]) {
+    for (const c of [...p.graveyard, ...p.exile, ...p.hand, ...p.library]) {
       if (!c.isCommander || !c.commanderRelocationPending) continue;
       c.commanderRelocationPending = false;
+      const from =
+        c.zone === 'exile'
+          ? 'exile'
+          : c.zone === 'hand'
+            ? 'hand'
+            : c.zone === 'library'
+              ? 'library'
+              : 'graveyard';
       next.pendingChoices.push({
         type: 'commanderToCommandZone',
         playerId: p.id,
         cardId: c.id,
-        from: c.zone === 'exile' ? 'exile' : 'graveyard',
+        from,
       });
       performed = true;
     }

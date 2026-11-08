@@ -5,6 +5,8 @@ import {
   addRedirectShield,
   applyDamageWithPrevention,
   applyDrawAmount,
+  applyLifeGain,
+  tryConsumeShieldCounter,
   deathDestination,
   devotionTo,
   domainCount,
@@ -81,8 +83,11 @@ function applyDamage(
   target: TargetRef,
   amount: number,
   sourceColors?: ManaColor[],
+  sourceControllerId?: string,
 ): GameState {
-  const prevented = applyDamageWithPrevention(state, target, amount);
+  const prevented = applyDamageWithPrevention(state, target, amount, {
+    sourceControllerId,
+  });
   let next = prevented.state;
   const dealt = prevented.dealt;
   target = prevented.target;
@@ -96,6 +101,7 @@ function applyDamage(
     }
     return next;
   }
+  if (target.kind !== 'permanent') return next;
   const found = findCard(next, target.permanentId);
   if (!found || found.zone !== 'battlefield') return next;
   const perm = found.player.battlefield.find((c) => c.id === target.permanentId);
@@ -191,7 +197,7 @@ export function applyEffects(
     switch (effect.type) {
       case 'damage': {
         const t = targets[effect.targetKey];
-        if (t) next = applyDamage(next, t, effect.amount, sourceColors);
+        if (t) next = applyDamage(next, t, effect.amount, sourceColors, controllerId);
         break;
       }
       case 'draw':
@@ -200,7 +206,7 @@ export function applyEffects(
       case 'gainLife': {
         const n = clonePlayers(next);
         const p = n.players.find((x) => x.id === controllerId);
-        if (p) p.life += effect.amount;
+        if (p) p.life += applyLifeGain(next, controllerId, effect.amount);
         next = n;
         break;
       }
@@ -229,6 +235,13 @@ export function applyEffects(
               ? found.player.battlefield.find((c) => c.id === id)
               : undefined;
           if (perm && hasKeyword(perm, 'indestructible')) break;
+          {
+            const sh = tryConsumeShieldCounter(next, id);
+            if (sh.consumed) {
+              next = sh.state;
+              break;
+            }
+          }
           if (perm?.regenerateShield) {
             const n = clonePlayers(next);
             const p = findBf(n, id);
@@ -246,8 +259,12 @@ export function applyEffects(
           const name = perm?.card.name;
           const dest = deathDestination(next, id);
           next = moveCard(next, id, dest).state;
-          if (perm?.card.type_line.includes('Creature')) {
-            next = { ...next, creatureDiedThisTurn: true };
+          if (perm?.card.type_line.includes('Creature') && dest === 'graveyard') {
+            next = {
+              ...next,
+              creatureDiedThisTurn: true,
+              creaturesDiedThisTurn: (next.creaturesDiedThisTurn || 0) + 1,
+            };
           }
           if (ctrl && dest === 'graveyard') {
             const dies = parseDiesEffects(oracle);
@@ -268,7 +285,7 @@ export function applyEffects(
       }
       case 'preventDamage': {
         const t = targets[effect.targetKey];
-        if (!t) break;
+        if (!t || t.kind === 'stack') break;
         next = addPreventionShield(next, {
           controllerId,
           kind: t.kind === 'player' ? 'player' : 'permanent',
@@ -530,7 +547,11 @@ export function applyEffects(
             const dies = parseDiesEffects(oracle);
             if (dies.length) next = applyEffects(next, controller, dies, {});
             if (wasCreature) {
-              next = { ...next, creatureDiedThisTurn: true };
+              next = {
+                ...next,
+                creatureDiedThisTurn: true,
+                creaturesDiedThisTurn: (next.creaturesDiedThisTurn || 0) + 1,
+              };
               next = fireCreatureDiesWatchers(next, controller, id);
             }
           }
@@ -728,7 +749,9 @@ export function applyEffects(
       case 'gainLifeIfBlessing': {
         const n = clonePlayers(next);
         const p = n.players.find((x) => x.id === controllerId);
-        if (p?.citysBlessing) p.life += effect.amount;
+        if (p?.citysBlessing) {
+          p.life += applyLifeGain(next, controllerId, effect.amount);
+        }
         next = n;
         break;
       }
@@ -1009,6 +1032,7 @@ export function applyEffects(
           died.push({ ctrl: p.id, id: creature.id });
           n = moveCard(n, creature.id, deathDestination(n, creature.id)).state;
           n.creatureDiedThisTurn = true;
+          n.creaturesDiedThisTurn = (n.creaturesDiedThisTurn || 0) + 1;
         }
         next = n;
         for (const d of died) next = fireCreatureDiesWatchers(next, d.ctrl, d.id);
@@ -1072,7 +1096,7 @@ export function applyEffects(
         const p = n.players.find((x) => x.id === controllerId);
         if (p) {
           const count = p.battlefield.filter((c) => isCreature(c)).length;
-          p.life += count;
+          p.life += applyLifeGain(next, controllerId, count);
         }
         next = n;
         break;
@@ -1084,7 +1108,15 @@ export function applyEffects(
           const perm = findBf(next, src.permanentId);
           if (perm) {
             const amt = effectivePower(perm, next);
-            if (amt > 0) next = applyDamage(next, dest, amt, perm.card.colors);
+            if (amt > 0) {
+              next = applyDamage(
+                next,
+                dest,
+                amt,
+                perm.card.colors,
+                perm.controller,
+              );
+            }
           }
         }
         break;
@@ -1146,7 +1178,7 @@ export function applyEffects(
           effect.fromKey === 'self'
             ? ({ kind: 'player', playerId: controllerId } as TargetRef)
             : targets[effect.fromKey];
-        if (from && to) {
+        if (from && to && from.kind !== 'stack' && to.kind !== 'stack') {
           const fromKind = from.kind === 'player' ? 'player' : 'permanent';
           const fromId = from.kind === 'player' ? from.playerId : from.permanentId;
           const toKind = to.kind === 'player' ? 'player' : 'permanent';
@@ -1236,7 +1268,9 @@ export function applyEffects(
       case 'damageEqualDevotion': {
         const amt = devotionTo(next, controllerId, effect.color);
         const t = targets[effect.targetKey];
-        if (t && amt > 0) next = applyDamage(next, t, amt, sourceColors);
+        if (t && amt > 0) {
+          next = applyDamage(next, t, amt, sourceColors, controllerId);
+        }
         break;
       }
       case 'drawEqualDevotion': {
@@ -1249,7 +1283,7 @@ export function applyEffects(
         if (amt > 0) {
           const n = clonePlayers(next);
           const p = n.players.find((x) => x.id === controllerId);
-          if (p) p.life += amt;
+          if (p) p.life += applyLifeGain(next, controllerId, amt);
           next = n;
         }
         break;
@@ -1257,7 +1291,9 @@ export function applyEffects(
       case 'damageEqualDomain': {
         const amt = domainCount(next, controllerId);
         const t = targets[effect.targetKey];
-        if (t && amt > 0) next = applyDamage(next, t, amt, sourceColors);
+        if (t && amt > 0) {
+          next = applyDamage(next, t, amt, sourceColors, controllerId);
+        }
         break;
       }
       case 'drawEqualDomain': {
@@ -1340,6 +1376,52 @@ export function applyEffects(
           }
         }
         next = n;
+        break;
+      }
+      case 'loseLifeEachOpponent': {
+        const n = clonePlayers(next);
+        for (const p of n.players) {
+          if (p.id === controllerId || p.hasLost) continue;
+          p.life -= effect.amount;
+          if (effect.amount > 0) p.lostLifeThisTurn = true;
+        }
+        next = n;
+        break;
+      }
+      case 'discardEachOpponent': {
+        const n = clonePlayers(next);
+        for (const p of n.players) {
+          if (p.id === controllerId || p.hasLost) continue;
+          const amt = Math.min(effect.amount, p.hand.length);
+          if (amt <= 0) continue;
+          // Auto-discard from end of hand (Arena-like when no choice UI)
+          for (let i = 0; i < amt; i++) {
+            const c = p.hand.pop();
+            if (!c) break;
+            c.zone = 'graveyard';
+            if (c.isCommander) c.commanderRelocationPending = true;
+            p.graveyard.push(c);
+          }
+        }
+        next = n;
+        break;
+      }
+      case 'addCounterAllYouControl': {
+        const n = clonePlayers(next);
+        const p = n.players.find((x) => x.id === controllerId);
+        if (p) {
+          for (const c of p.battlefield) {
+            if (!isCreature(c)) continue;
+            c.counters[effect.counter] =
+              (c.counters[effect.counter] || 0) + effect.amount;
+          }
+        }
+        next = n;
+        break;
+      }
+      case 'drawEqualDiedThisTurn': {
+        const amt = next.creaturesDiedThisTurn || (next.creatureDiedThisTurn ? 1 : 0);
+        if (amt > 0) next = drawCards(next, controllerId, amt);
         break;
       }
       case 'noop':

@@ -489,7 +489,22 @@ function beginCastFrom(
 
   const card = findCastable(state, playerId, cardId, from);
   if (!card) return state;
-  if (from === 'command' && !card.isCommander) return state;
+  if (from === 'command' && !card.isCommander && !card.isCompanion) return state;
+  // Commander color identity (903.4) — ⊆ union of all commanders (Partner)
+  {
+    const cmds = [
+      ...player.commandZone.filter((c) => c.isCommander),
+      ...player.battlefield.filter((c) => c.isCommander),
+    ];
+    if (cmds.length) {
+      const allow = new Set<string>();
+      for (const cmd of cmds) {
+        for (const col of cmd.card.color_identity || []) allow.add(col);
+      }
+      const id = card.card.color_identity || [];
+      if (id.some((c) => !allow.has(c))) return state;
+    }
+  }
   if (from === 'flashback' && !parseFlashbackCost(card.card.oracle_text)) return state;
   if (from === 'jumpstart') {
     if (!parseJumpStartCost(card.card.oracle_text)) return state;
@@ -912,6 +927,8 @@ export function beginCycle(state: GameState, playerId: string, cardId: string): 
     R: 0,
     G: 0,
     C: 0,
+    hybrids: [],
+    phyrexian: [],
     unpayable: false,
   };
   if (cycleCost > 0 && !canPayMana(player.manaPool, payCost)) return state;
@@ -1225,7 +1242,7 @@ function finalizeCast(
 
   let next = clonePlayers(state);
   next.pendingCast = null;
-  const p = next.players.find((x) => x.id === playerId)!;
+  let p = next.players.find((x) => x.id === playerId)!;
 
   // Tap convoke/improvise / exile delve before mana payment
   for (const id of convokeIds) {
@@ -1246,11 +1263,12 @@ function finalizeCast(
 
   // Additional costs
   if (extraCosts.sacrificeCreature) {
-    const sacIdx = p.battlefield.findIndex((c) => isCreature(c));
-    if (sacIdx < 0) return { ...state, pendingCast: null };
-    const [sac] = p.battlefield.splice(sacIdx, 1);
-    sac.zone = 'graveyard';
-    p.graveyard.push(sac);
+    const sac = p.battlefield.find((c) => isCreature(c));
+    if (!sac) return { ...state, pendingCast: null };
+    next = moveCard(next, sac.id, 'graveyard').state;
+    const p2 = next.players.find((x) => x.id === playerId);
+    if (!p2) return { ...state, pendingCast: null };
+    p = p2;
   }
   if (extraCosts.discard) {
     let n = extraCosts.discard;
@@ -1339,6 +1357,7 @@ function finalizeCast(
     cardInstance: instance,
     targets,
     script,
+    sourceColors: instance.card.colors || [],
   };
   next.stack = [...next.stack, obj];
 
@@ -1353,6 +1372,7 @@ function finalizeCast(
           name: `${instance.card.name} (storm)`,
           targets: { ...targets },
           script,
+          sourceColors: instance.card.colors || [],
         },
       ];
     }
@@ -1388,7 +1408,7 @@ export function resolveWardChoice(state: GameState, pay: boolean): GameState {
   if (!p) return state;
   const wardMana = withExtraGeneric(parseManaCost('{0}'), choice.cost);
   // {0} parse may be unpayable empty — force generic only
-  const cost = { generic: choice.cost, W: 0, U: 0, B: 0, R: 0, G: 0, C: 0, unpayable: false };
+  const cost = { generic: choice.cost, W: 0, U: 0, B: 0, R: 0, G: 0, C: 0, hybrids: [], phyrexian: [], unpayable: false };
   if (choice.cost > 0) {
     if (!canPayMana(p.manaPool, cost)) return state;
     const paid = payMana(p.manaPool, cost);
@@ -1413,6 +1433,32 @@ export function resolveWardChoice(state: GameState, pay: boolean): GameState {
   );
 }
 
+/** CR 608.2b — drop targets that are no longer legal; if none remain and spell needed any, fizzle. */
+function filterLegalResolveTargets(
+  state: GameState,
+  controllerId: string,
+  script: SpellScript | undefined,
+  targets: Record<string, TargetRef> | undefined,
+  sourceColors?: ManaColor[],
+): { targets: Record<string, TargetRef>; fizzle: boolean } {
+  const slots = script?.targets || [];
+  const chosen = targets || {};
+  if (slots.length === 0) return { targets: chosen, fizzle: false };
+  const kept: Record<string, TargetRef> = {};
+  let anyRequired = false;
+  let anyKept = false;
+  for (const slot of slots) {
+    anyRequired = true;
+    const t = chosen[slot.key];
+    if (!t) continue;
+    if (isLegalTarget(state, slot.filter, t, controllerId, sourceColors)) {
+      kept[slot.key] = t;
+      anyKept = true;
+    }
+  }
+  return { targets: kept, fizzle: anyRequired && !anyKept };
+}
+
 /** Resolve top spell: apply effects, then permanent → BF / instant → GY. */
 export function resolveSpellEffects(state: GameState): GameState {
   if (state.stack.length === 0) return state;
@@ -1429,14 +1475,22 @@ export function resolveSpellEffects(state: GameState): GameState {
     // Activated / triggered abilities + storm copies
     const script = top.script;
     if (script) {
-      next = applyEffects(
+      const filtered = filterLegalResolveTargets(
         next,
         top.controller,
-        script.effects,
-        top.targets || {},
-        undefined,
-        top.sourcePermanentId,
+        script,
+        top.targets,
       );
+      if (!filtered.fizzle) {
+        next = applyEffects(
+          next,
+          top.controller,
+          script.effects,
+          filtered.targets,
+          undefined,
+          top.sourcePermanentId,
+        );
+      }
     }
   } else if (top.kind === 'spell' && top.cardInstance) {
     const inst = top.cardInstance;
@@ -1576,8 +1630,23 @@ export function resolveSpellEffects(state: GameState): GameState {
         }
       } else {
         const script = top.script || parseOracleScript(inst.card.oracle_text, inst.card.type_line);
-        const targets = top.targets || {};
-        next = applyEffects(next, top.controller, script.effects, targets);
+        const filtered = filterLegalResolveTargets(
+          next,
+          top.controller,
+          script,
+          top.targets,
+          top.sourceColors || inst.card.colors,
+        );
+        if (!filtered.fizzle) {
+          next = applyEffects(
+            next,
+            top.controller,
+            script.effects,
+            filtered.targets,
+            top.sourceColors || inst.card.colors,
+          );
+        }
+        const targets = filtered.targets;
         const ownerAfter = next.players.find((p) => p.id === inst.owner);
         if (inst.castViaBuyback) {
           inst.zone = 'hand';

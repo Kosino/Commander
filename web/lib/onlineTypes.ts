@@ -1,8 +1,14 @@
-/** Client-safe types for online 2P (no server store). */
+/** Client-safe types for online multiplayer (no server store). */
 export type { GameState } from './engine';
 export type { TargetRef } from './engine';
 
-export type SeatId = 'p1' | 'p2';
+export type SeatId = 'p1' | 'p2' | 'p3' | 'p4';
+export const ALL_SEATS: SeatId[] = ['p1', 'p2', 'p3', 'p4'];
+export type MaxSeats = 2 | 3 | 4;
+
+export function isSeatId(v: unknown): v is SeatId {
+  return v === 'p1' || v === 'p2' || v === 'p3' || v === 'p4';
+}
 
 export type RoomAction =
   | { type: 'pass' }
@@ -40,8 +46,23 @@ export type RoomAction =
   | { type: 'focusAttacker'; attackerId: string }
   | { type: 'toggleDraftBlocker'; attackerId: string; blockerId: string }
   | { type: 'confirmBlockers' }
+  | { type: 'confirmDamageAssign' }
+  | {
+      type: 'setDamageAssignAmount';
+      attackerId: string;
+      target: { kind: 'blocker'; blockerId: string } | { kind: 'player' };
+      amount: number;
+    }
+  | { type: 'beginLoyalty'; permanentId: string; abilityIndex: number }
+  | { type: 'cancelLoyalty' }
+  | { type: 'beginActivatedIndex'; permanentId: string; abilityIndex: number }
+  | { type: 'cancelActivated' }
+  | { type: 'resolveTriggerOrder'; orderedIds: string[] }
   | { type: 'resolveLegend'; keepId: string }
   | { type: 'resolveCommanderZone'; cardId: string; toCommandZone: boolean }
+  | { type: 'resolveMulliganKeep' }
+  | { type: 'resolveMulliganTake' }
+  | { type: 'resolveMulliganBottom'; bottomIds: string[] }
   | { type: 'resolveWard'; pay: boolean }
   | { type: 'resolveScry'; bottomIds: string[] }
   | { type: 'resolveSurveil'; toGyIds: string[] }

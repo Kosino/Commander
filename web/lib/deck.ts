@@ -1,3 +1,9 @@
+import {
+  hasCompanion,
+  mergedColorIdentity,
+  partnersCompatible,
+} from './commanderExtras';
+
 export interface Card {
   name: string;
   mana_cost?: string;
@@ -7,11 +13,17 @@ export interface Card {
   toughness?: string;
   color_identity?: string[];
   oracle_id?: string;
+  keywords?: string[];
+  image_uri?: string;
 }
 
 export interface DeckExport {
   name?: string;
   commander: Card | null;
+  /** Second commander (Partner). */
+  partner?: Card | null;
+  /** Companion (outside deck / starts in command). */
+  companion?: Card | null;
   cards: Card[];
 }
 
@@ -113,16 +125,36 @@ export function computeDeckStats(deck: Card[]): DeckStats {
   };
 }
 
-export function validateDeck(deck: Card[], commander: Card | null): string[] {
+export function validateDeck(
+  deck: Card[],
+  commander: Card | null,
+  opts?: { partner?: Card | null; companion?: Card | null },
+): string[] {
   const errors: string[] = [];
+  const partner = opts?.partner || null;
+  const companion = opts?.companion || null;
 
   if (!commander) {
     errors.push('Chybí commander (Legendary Creature).');
     return errors;
   }
 
-  if (deck.length !== 100) {
-    errors.push(`Deck má ${deck.length} karet, musí mít přesně 100.`);
+  // 100 main + 1 commander; with Partner: 98 main + 2 commanders.
+  const need = partner ? 98 : 100;
+  if (deck.length !== need) {
+    errors.push(
+      partner
+        ? `Deck má ${deck.length} karet, s Partnerem musí mít 98 (+ 2 commandery).`
+        : `Deck má ${deck.length} karet, musí mít přesně 100.`,
+    );
+  }
+
+  if (partner && !partnersCompatible(commander, partner)) {
+    errors.push('Partner: karty nejsou kompatibilní (Partner / Partner with).');
+  }
+
+  if (companion && !hasCompanion(companion)) {
+    errors.push(`Companion: ${companion.name} nemá keyword Companion.`);
   }
 
   const nameCounts = new Map<string, number>();
@@ -136,7 +168,7 @@ export function validateDeck(deck: Card[], commander: Card | null): string[] {
     }
   }
 
-  const cmdIdentity = new Set(commander.color_identity || []);
+  const cmdIdentity = new Set(mergedColorIdentity(commander, partner));
   for (const card of deck) {
     for (const color of card.color_identity || []) {
       if (!cmdIdentity.has(color)) {
@@ -148,21 +180,60 @@ export function validateDeck(deck: Card[], commander: Card | null): string[] {
     }
   }
 
+  const checkBan = (name: string, where: string) => {
+    if (COMMANDER_BANNED.has(name.toLowerCase())) {
+      errors.push(`Banned ${where}: ${name}`);
+    }
+  };
+  checkBan(commander.name, 'commander');
+  if (partner) checkBan(partner.name, 'partner');
+  if (companion) checkBan(companion.name, 'companion');
+  for (const card of deck) checkBan(card.name, 'card');
+
+  const gc = [...deck, commander, partner, companion]
+    .filter((c): c is Card => !!c)
+    .filter((c) => GAME_CHANGERS.has(c.name.toLowerCase()))
+    .map((c) => c.name);
+  if (gc.length) {
+    errors.push(`Info — Game Changers: ${[...new Set(gc)].join(', ')}`);
+  }
+
   return errors;
 }
 
-export function exportDeckJson(commander: Card | null, deck: Card[], name = 'Untitled Deck'): string {
-  const payload: DeckExport = { name, commander, cards: deck };
+export function exportDeckJson(
+  commander: Card | null,
+  deck: Card[],
+  name = 'Untitled Deck',
+  extras?: { partner?: Card | null; companion?: Card | null },
+): string {
+  const payload: DeckExport = {
+    name,
+    commander,
+    partner: extras?.partner || null,
+    companion: extras?.companion || null,
+    cards: deck,
+  };
   return JSON.stringify(payload, null, 2);
 }
 
 /** Moxfield-ish text: 1 Card Name per line, commander section first. */
-export function exportDeckText(commander: Card | null, deck: Card[]): string {
+export function exportDeckText(
+  commander: Card | null,
+  deck: Card[],
+  extras?: { partner?: Card | null; companion?: Card | null },
+): string {
   const lines: string[] = [];
   if (commander) {
     lines.push('Commander');
     lines.push(`1 ${commander.name}`);
+    if (extras?.partner) lines.push(`1 ${extras.partner.name}`);
     lines.push('');
+    if (extras?.companion) {
+      lines.push('Companion');
+      lines.push(`1 ${extras.companion.name}`);
+      lines.push('');
+    }
     lines.push('Deck');
   }
 
@@ -187,6 +258,8 @@ export function parseDeckJson(raw: string): DeckExport {
   return {
     name: data.name,
     commander: data.commander ?? null,
+    partner: data.partner ?? null,
+    companion: data.companion ?? null,
     cards: data.cards,
   };
 }
@@ -237,4 +310,90 @@ export function parseDeckText(raw: string): { commanderName: string | null; entr
   }
 
   return { commanderName, entries };
+}
+
+/** Official Commander banned (subset; update with CR/RC lists as needed). */
+export const COMMANDER_BANNED = new Set(
+  [
+    'Ancestral Recall',
+    'Balance',
+    'Biorhythm',
+    'Black Lotus',
+    'Channel',
+    'Dockside Extortionist',
+    'Emrakul, the Aeons Torn',
+    'Erayo, Soratami Ascendant',
+    'Fastbond',
+    'Flash',
+    'Golos, Tireless Pilgrim',
+    'Griselbrand',
+    'Hullbreacher',
+    'Iona, Shield of Emeria',
+    'Jeweled Lotus',
+    'Library of Alexandria',
+    'Limited Resources',
+    'Lutri, the Spellchaser',
+    'Mana Crypt',
+    'Mana Geyser',
+    'Mox Emerald',
+    'Mox Jet',
+    'Mox Pearl',
+    'Mox Ruby',
+    'Mox Sapphire',
+    'Nadu, Winged Wisdom',
+    'Paradox Engine',
+    'Primeval Titan',
+    'Prophet of Kruphix',
+    'Recurring Nightmare',
+    'Rofellos, Llanowar Emissary',
+    'Sundering Titan',
+    'Sway of the Stars',
+    'Time Vault',
+    'Time Walk',
+    'Tinker',
+    'Tolarian Academy',
+    'Trade Secrets',
+    'Upheaval',
+    'Yawgmoth\'s Bargain',
+  ].map((n) => n.toLowerCase()),
+);
+
+/** Commander Bracket Game Changers (advisory). */
+export const GAME_CHANGERS = new Set(
+  [
+    'Cyclonic Rift',
+    'Demonic Tutor',
+    'Fierce Guardianship',
+    'Force of Will',
+    'Gaea\'s Cradle',
+    'Jeska\'s Will',
+    'Mana Drain',
+    'Rhystic Study',
+    'Smothering Tithe',
+    'The One Ring',
+    'Thassa\'s Oracle',
+    'Underworld Breach',
+  ].map((n) => n.toLowerCase()),
+);
+
+export type DeckLegality = {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  gameChangers: string[];
+};
+
+/** EDH legality via builder validateDeck + structured Game Changers. */
+export function validateEdhDeck(deck: DeckExport): DeckLegality {
+  const raw = validateDeck(deck.cards, deck.commander, {
+    partner: deck.partner,
+    companion: deck.companion,
+  });
+  const errors = raw.filter((e) => !e.startsWith('Info —'));
+  const gcLine = raw.find((e) => e.startsWith('Info — Game Changers:'));
+  const gameChangers = gcLine
+    ? gcLine.replace(/^Info — Game Changers:\s*/, '').split(', ').filter(Boolean)
+    : [];
+  const warnings = gcLine ? [gcLine.replace(/^Info — /, '')] : [];
+  return { ok: errors.length === 0, errors, warnings, gameChangers };
 }

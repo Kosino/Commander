@@ -15,7 +15,11 @@ export function loadPlayDeck(): StoredDeck | null {
     if (!raw) return null;
     const data = JSON.parse(raw) as StoredDeck;
     if (!data?.commander || !Array.isArray(data.cards)) return null;
-    return data;
+    return {
+      ...data,
+      partner: data.partner ?? null,
+      companion: data.companion ?? null,
+    };
   } catch {
     return null;
   }

@@ -124,6 +124,10 @@ export type Effect =
       name: string;
       typeline: string;
     }
+  | { type: 'loseLifeEachOpponent'; amount: number }
+  | { type: 'discardEachOpponent'; amount: number }
+  | { type: 'addCounterAllYouControl'; counter: string; amount: number }
+  | { type: 'drawEqualDiedThisTurn' }
   | { type: 'noop' };
 
 /** One mode of a modal spell ("Choose one —"). */
@@ -397,7 +401,7 @@ function parseEffectsFromText(
   }
 
   const token = text.match(
-    /create\s+(a|one|two|three|\d+)\s+(\d+)\/(\d+)\s+(?:(white|blue|black|red|green|colorless)\s+)?(\w+)\s+creature\s+tokens?/i,
+    /create\s+(a|one|two|three|\d+)\s+(\d+)\/(\d+)\s+(?:(white|blue|black|red|green|colorless)\s+)?([A-Za-z][\w']*)\s+creature\s+tokens?/i,
   );
   if (token) {
     effects.push({
@@ -407,6 +411,20 @@ function parseEffectsFromText(
       toughness: token[3],
       name: token[5],
       typeline: `Creature — ${token[5]}`,
+    });
+  }
+  // "Create a 2/2 green and white Wolf creature token" (multi-color)
+  const tokenMulti = text.match(
+    /create\s+(a|one|two|three|\d+)\s+(\d+)\/(\d+)\s+(?:(?:white|blue|black|red|green|colorless)(?:\s+and\s+(?:white|blue|black|red|green))*\s+)?([A-Za-z][\w']*)\s+creature\s+tokens?/i,
+  );
+  if (!token && tokenMulti) {
+    effects.push({
+      type: 'createToken',
+      count: parseCount(tokenMulti[1]),
+      power: tokenMulti[2],
+      toughness: tokenMulti[3],
+      name: tokenMulti[4],
+      typeline: `Creature — ${tokenMulti[4]}`,
     });
   }
 
@@ -842,6 +860,82 @@ function parseEffectsFromText(
   const backup = text.match(/\bbackup\s+(\d+)\b/i);
   if (backup) effects.push({ type: 'backup', amount: parseInt(backup[1], 10) });
 
+  // Each opponent loses N life / discards
+  const oppLose = text.match(/each\s+opponent\s+loses?\s+(\d+)\s+life/i);
+  if (oppLose) {
+    effects.push({ type: 'loseLifeEachOpponent', amount: parseInt(oppLose[1], 10) });
+  }
+  if (/each\s+opponent\s+discards?\s+(a|one)\s+card/i.test(text)) {
+    effects.push({ type: 'discardEachOpponent', amount: 1 });
+  }
+  const oppDiscN = text.match(/each\s+opponent\s+discards?\s+(\d+)\s+cards?/i);
+  if (oppDiscN) {
+    effects.push({ type: 'discardEachOpponent', amount: parseInt(oppDiscN[1], 10) });
+  }
+
+  // Put N +1/+1 counters on each creature you control
+  const countersAll = text.match(
+    /put\s+(a|one|two|three|\d+)\s+\+1\/\+1\s+counters?\s+on\s+each\s+creature\s+you\s+control/i,
+  );
+  if (countersAll) {
+    effects.push({
+      type: 'addCounterAllYouControl',
+      counter: '+1/+1',
+      amount: parseCount(countersAll[1]),
+    });
+  }
+
+  // Draw a card for each creature that died this turn
+  if (
+    /draw\s+(a|one)\s+card\s+for\s+each\s+creature\s+that\s+died\s+this\s+turn/i.test(text) ||
+    /draw\s+cards?\s+equal\s+to\s+the\s+number\s+of\s+creatures?\s+that\s+died\s+this\s+turn/i.test(
+      text,
+    )
+  ) {
+    effects.push({ type: 'drawEqualDiedThisTurn' });
+  }
+
+  // Destroy target artifact or enchantment
+  if (
+    opts.allowTargets &&
+    /destroy\s+target\s+artifact\s+or\s+enchantment/i.test(text)
+  ) {
+    const key = addTarget(targets, 'permanent', 'Choose artifact or enchantment');
+    effects.push({ type: 'destroy', targetKey: key });
+  }
+
+  // Return target creature card from your graveyard to your hand
+  if (
+    opts.allowTargets &&
+    /return\s+target\s+creature\s+card\s+from\s+(?:your|a)\s+graveyard\s+to\s+(?:your|its\s+owner'?s)\s+hand/i.test(
+      text,
+    )
+  ) {
+    const key = addTarget(targets, 'creatureCardInYourGy', 'Choose creature card in your GY');
+    effects.push({ type: 'returnToHand', targetKey: key });
+  }
+
+  // Target creature gains KEYWORD until end of turn
+  if (opts.allowTargets) {
+    const gainKw = text.match(
+      /target\s+creature\s+gains?\s+(flying|first\s+strike|double\s+strike|deathtouch|lifelink|vigilance|trample|haste|hexproof|indestructible|menace)\s+until\s+end\s+of\s+turn/i,
+    );
+    if (gainKw) {
+      const key = addTarget(targets, 'creature', 'Choose creature to grant keyword');
+      const kw = gainKw[1].toLowerCase().replace(/\s+/g, ' ');
+      effects.push({ type: 'grantKeyword', targetKey: key, keyword: kw });
+    }
+  }
+
+  // You draw a card and you lose 1 life (sign in blood-ish) — already draw+lose separate
+  const drawLose = text.match(
+    /(?:you\s+)?draw\s+(a|one|two|three|\d+)\s+cards?\s+and\s+(?:you\s+)?lose\s+(\d+)\s+life/i,
+  );
+  if (drawLose) {
+    effects.push({ type: 'draw', amount: parseCount(drawLose[1]) });
+    effects.push({ type: 'loseLife', amount: parseInt(drawLose[2], 10) });
+  }
+
   for (const d of delayed) {
     const nested: Effect[] = [];
     parseEffectsFromText(d.clause, targets, nested, { allowTargets: opts.allowTargets });
@@ -1020,6 +1114,7 @@ export function continuousGrantedKeywords(
       battlefield: {
         id: string;
         controller: string;
+        attachedTo?: string;
         card: { oracle_text?: string };
       }[];
     }[];
@@ -1056,6 +1151,20 @@ export function continuousGrantedKeywords(
         );
         if (reYou.test(text) && src.controller === permanent.controller) granted.add(kw);
         if (reOther.test(text) && src.controller === permanent.controller) granted.add(kw);
+      }
+      // Equipped / Enchanted creature has KW
+      if (src.attachedTo === permanent.id) {
+        for (const kw of kwList) {
+          const re = new RegExp(
+            `(?:equipped|enchanted)\\s+creature\\s+(?:gets?\\s+[^.]*(?:and\\s+)?has\\s+|has\\s+)${kw.replace(' ', '\\s+')}`,
+            'i',
+          );
+          const re2 = new RegExp(
+            `(?:equipped|enchanted)\\s+creature\\s+has\\s+${kw.replace(' ', '\\s+')}`,
+            'i',
+          );
+          if (re.test(text) || re2.test(text)) granted.add(kw);
+        }
       }
     }
   }
@@ -1626,6 +1735,61 @@ export function parseCombatDamagePlayerEffects(oracleText?: string): Effect[] {
   return parseTargetlessClauses(extractCombatDamagePlayerClauses(oracleText));
 }
 
+/** True if script has at least one non-noop effect (or modal with real modes). */
+export function scriptHasRealEffects(script: SpellScript): boolean {
+  if (script.modes && script.modes.length > 0) {
+    return script.modes.some((m) => m.effects.some((e) => e.type !== 'noop'));
+  }
+  return script.effects.some((e) => e.type !== 'noop');
+}
+
+/**
+ * Coverage helper — how well we parse a card for cast/ETB/dies.
+ * Lands with mana abilities count as ok without spell effects.
+ */
+export function cardParseCoverage(card: {
+  type_line?: string;
+  oracle_text?: string;
+  mana_cost?: string;
+}): {
+  ok: boolean;
+  cast: boolean;
+  etb: boolean;
+  dies: boolean;
+  land: boolean;
+} {
+  const tl = card.type_line || '';
+  const land = /\bLand\b/i.test(tl);
+  if (land) {
+    return { ok: true, cast: true, etb: true, dies: true, land: true };
+  }
+  const cast = scriptHasRealEffects(
+    parseOracleScript(card.oracle_text, tl, card.mana_cost),
+  );
+  const etb = scriptHasRealEffects(parseEtbScript(card.oracle_text));
+  const dies = parseDiesEffects(card.oracle_text).length > 0;
+  // Permanent without text = vanilla ok; with text need cast or trigger coverage
+  const text = (card.oracle_text || '').trim();
+  if (!text) return { ok: true, cast: true, etb: true, dies: true, land: false };
+  // Keyword soup / equip / crew / cycling lines without spell body still "ok" for play
+  const keywordOnly =
+    !/\b(target|draw|destroy|exile|create|deal|deals|return|put|gain|lose|search|counter|mill|scry|surveil)\b/i.test(
+      text,
+    ) &&
+    (/^[A-Za-z][A-Za-z\s,/]*(?:\(.+\))?$/m.test(text.split('\n')[0] || '') ||
+      /\b(equip|crew|cycling|flashback|unearth|escape|embalm|modular|evolve|undying|persist|mentor|exalted|prowess|training|bloodthirst|renown|adapt|monstrosity)\b/i.test(
+        text,
+      ));
+  const ok =
+    cast ||
+    etb ||
+    dies ||
+    keywordOnly ||
+    /\b\{T\}:\s*Add\b/i.test(text) ||
+    /\b\{T\}:/i.test(text);
+  return { ok, cast, etb, dies, land: false };
+}
+
 export function extractLandfallClauses(oracleText?: string): string[] {
   const flat = (oracleText || '').replace(/\n/g, ' ');
   const out: string[] = [];
@@ -1703,17 +1867,53 @@ export function parseEtbWatcher(
 
 /** First `{T}: …` activated ability (non-mana). */
 export function parseTapAbility(oracleText?: string): SpellScript | null {
-  if (!oracleText) return null;
-  const m = oracleText.match(/\{T\}:\s*([^\n]+)/i);
-  if (!m) return null;
-  const line = m[1].trim();
-  // Mana abilities handled separately
-  if (/^add\b/i.test(line) || /\{[WUBRGC\d]+\}/.test(line) && /^add\b/i.test(line)) return null;
-  if (/^add\s+/i.test(line)) return null;
+  const all = parseActivatedAbilities(oracleText).filter((a) => a.needsTap);
+  return all[0]?.script || null;
+}
 
-  const targets: TargetSlot[] = [];
-  const effects: Effect[] = [];
-  parseEffectsFromText(line, targets, effects, { allowTargets: true });
-  if (effects.length === 0 || (effects.length === 1 && effects[0].type === 'noop')) return null;
-  return { targets, effects };
+export type ParsedActivated = {
+  /** Mana cost symbols excluding {T}, e.g. "{2}{G}" or "". */
+  manaCost: string;
+  needsTap: boolean;
+  script: SpellScript;
+  /** Cost prefix as written, e.g. "{T}, {2}". */
+  costLabel: string;
+};
+
+/**
+ * Parse activated abilities `{cost}: effect` including non-tap (e.g. `{2}: Draw a card`).
+ * Skips mana abilities (`Add {G}`).
+ */
+export function parseActivatedAbilities(oracleText?: string): ParsedActivated[] {
+  if (!oracleText) return [];
+  const out: ParsedActivated[] = [];
+  for (const raw of oracleText.split(/\n/)) {
+    const line = raw.trim();
+    // "{T}: …" or "{2}{G}: …" or "{T}, {1}: …"
+    const m = line.match(/^((?:\{[^}]+\}(?:,\s*)?)+):\s*(.+)$/i);
+    if (!m) continue;
+    const costPart = m[1].trim();
+    const effectPart = m[2].trim();
+    if (/^add\b/i.test(effectPart)) continue;
+
+    const needsTap = /\{T\}/i.test(costPart);
+    const manaCost = costPart
+      .replace(/\{T\}/gi, '')
+      .replace(/,\s*/g, '')
+      .replace(/\s+/g, '');
+
+    const targets: TargetSlot[] = [];
+    const effects: Effect[] = [];
+    parseEffectsFromText(effectPart, targets, effects, { allowTargets: true });
+    if (effects.length === 0 || (effects.length === 1 && effects[0].type === 'noop')) {
+      continue;
+    }
+    out.push({
+      manaCost,
+      needsTap,
+      script: { targets, effects },
+      costLabel: costPart.replace(/\s+/g, ''),
+    });
+  }
+  return out;
 }

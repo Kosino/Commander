@@ -4,6 +4,7 @@
  */
 import {
   AttackerDecl,
+  DamageAssignEntry,
   emptyCombat,
   GameState,
   hasKeyword,
@@ -152,14 +153,14 @@ export function confirmAttackers(state: GameState): GameState {
   const draft = new Set(state.combat.draftAttackerIds);
   // Goaded creatures must attack if able (701.38)
   for (const perm of active.battlefield) {
-    if (perm.goaded && canAttack(perm)) draft.add(perm.id);
+    if (perm.goaded && canAttack(perm, next)) draft.add(perm.id);
   }
   for (const id of draft) {
     const found = findCard(next, id);
     if (!found || found.zone !== 'battlefield') continue;
     if (found.player.id !== active.id) continue;
     const perm = found.player.battlefield.find((c) => c.id === id);
-    if (!perm || (!canAttack(perm) && !(perm.summoningSick && hasKeywordState(perm, 'haste', next)))) {
+    if (!perm || !canAttack(perm, next)) {
       continue;
     }
     if (!hasKeywordState(perm, 'vigilance', next)) perm.tapped = true;
@@ -441,7 +442,11 @@ export function confirmBlockers(state: GameState): GameState {
           ? af.player.battlefield.find((c) => c.id === a.attackerId)
           : undefined;
       // Menace (702.110): must be blocked by ≥2 creatures or not at all.
-      if (attacker && hasKeyword(attacker, 'menace') && blockers.length === 1) {
+      if (
+        attacker &&
+        hasKeywordState(attacker, 'menace', next) &&
+        blockers.length === 1
+      ) {
         blockers = [];
       }
       return { ...a, blockers };
@@ -541,10 +546,12 @@ function dealCombatToPlaneswalker(
     next,
     { kind: 'permanent', permanentId: planeswalkerId },
     amount,
+    { sourceControllerId: attacker.controller },
   );
   syncDamageReplacements(next, prev.state);
   amount = prev.dealt;
   if (amount <= 0) return;
+  if (prev.target.kind === 'stack') return;
   applyRedirectedCombatDamage(next, attacker, prev.target, amount);
 }
 
@@ -560,13 +567,15 @@ function dealCombatToPlayer(
     dealCombatToPlaneswalker(next, attacker, planeswalkerId, amount);
     return;
   }
-  const prev = applyDamageWithPrevention(next, { kind: 'player', playerId }, amount);
+  const prev = applyDamageWithPrevention(next, { kind: 'player', playerId }, amount, {
+    sourceControllerId: attacker.controller,
+  });
   syncDamageReplacements(next, prev.state);
   amount = prev.dealt;
   if (amount <= 0) return;
-  const stillPlayer = prev.target.kind === 'player';
+  if (prev.target.kind === 'stack') return;
   applyRedirectedCombatDamage(next, attacker, prev.target, amount, playerId);
-  if (!stillPlayer) return;
+  if (prev.target.kind !== 'player') return;
 
   const destPlayerId = prev.target.playerId;
   const toxic = getToxicAmount(attacker.card);
@@ -581,7 +590,7 @@ function dealCombatToPlayer(
 
   // Renown (702.112) — first combat damage to a player
   const renownN = parseRenown(attacker.card.oracle_text, attacker.card.keywords);
-  if (renownN != null && renownN > 0 && !attacker.renowned && stillPlayer) {
+  if (renownN != null && renownN > 0 && !attacker.renowned) {
     const af = findCard(next, attacker.id);
     const perm =
       af?.zone === 'battlefield'
@@ -616,12 +625,14 @@ function dealDamageToCreature(
     next,
     { kind: 'permanent', permanentId: dest.id },
     amount,
+    { sourceControllerId: source.controller },
   );
   syncDamageReplacements(next, prev.state);
   amount = prev.dealt;
   if (amount <= 0) return 0;
   if (prev.target.kind === 'player') {
-    const p = next.players.find((x) => x.id === prev.target.playerId);
+    const pid = prev.target.playerId;
+    const p = next.players.find((x) => x.id === pid);
     if (p && !p.hasLost) {
       if (hasKeyword(source, 'infect')) p.poison += amount;
       else {
@@ -631,6 +642,7 @@ function dealDamageToCreature(
     }
     return amount;
   }
+  if (prev.target.kind !== 'permanent') return 0;
   const destId = prev.target.permanentId;
   const found = findCard(next, destId);
   const perm =
@@ -647,10 +659,74 @@ function dealDamageToCreature(
   return amount;
 }
 
+/** Default Arena-like lethal assignment for one attacker. */
+export function defaultDamageAssign(
+  state: GameState,
+  attacker: CardInstance,
+  atk: AttackerDecl,
+  power: number,
+): DamageAssignEntry {
+  const entry: DamageAssignEntry = { toBlockers: {}, toPlayer: 0 };
+  if (power <= 0) return entry;
+  if (atk.blockers.length === 0) {
+    entry.toPlayer = power;
+    return entry;
+  }
+  const living: CardInstance[] = [];
+  for (const blockerId of atk.blockers) {
+    const bf = findCard(state, blockerId);
+    if (!bf || bf.zone !== 'battlefield') continue;
+    const blocker = bf.player.battlefield.find((c) => c.id === blockerId);
+    if (blocker) living.push(blocker);
+  }
+  if (living.length === 0) {
+    if (hasKeyword(attacker, 'trample')) entry.toPlayer = power;
+    return entry;
+  }
+  const trample = hasKeyword(attacker, 'trample');
+  let remaining = power;
+  for (let i = 0; i < living.length; i++) {
+    const blocker = living[i];
+    const isLast = i === living.length - 1;
+    if (remaining <= 0) break;
+    const need = lethalNeeded(attacker, blocker, state);
+    const toBlocker = trample
+      ? Math.min(remaining, need)
+      : isLast
+        ? remaining
+        : Math.min(remaining, need);
+    entry.toBlockers[blocker.id] = toBlocker;
+    remaining -= toBlocker;
+  }
+  if (remaining > 0 && trample) entry.toPlayer = remaining;
+  else if (remaining > 0 && living.length > 0) {
+    const last = living[living.length - 1];
+    entry.toBlockers[last.id] = (entry.toBlockers[last.id] || 0) + remaining;
+  }
+  return entry;
+}
+
+function needsManualDamageAssign(state: GameState, wave: Wave): boolean {
+  const combat = state.combat;
+  if (!combat) return false;
+  const assigned = new Set(combat.assignedFirstWave);
+  for (const atk of combat.attackers) {
+    const af = findCard(state, atk.attackerId);
+    const attacker =
+      af?.zone === 'battlefield'
+        ? af.player.battlefield.find((c) => c.id === atk.attackerId)
+        : undefined;
+    if (!attacker || !shouldAssignThisWave(attacker, wave, assigned)) continue;
+    const power = effectivePower(attacker, state);
+    if (power <= 0) continue;
+    if (atk.blockers.length > 1) return true;
+    if (hasKeyword(attacker, 'trample') && atk.blockers.length >= 1) return true;
+  }
+  return false;
+}
+
 /**
- * Assign attacker damage among blockers in order (CR 510.1c MVP):
- * lethal (or 1 with DT) to each except last; remainder to last.
- * Trample: leftover after lethal assignment hits defending player (702.19).
+ * Assign attacker damage among blockers (manual map or CR 510.1c auto).
  * Returns total damage dealt (for lifelink).
  */
 function assignAttackerDamage(
@@ -659,67 +735,95 @@ function assignAttackerDamage(
   atk: AttackerDecl,
   power: number,
 ): number {
-  if (atk.blockers.length === 0) {
-    dealCombatToPlayer(
-      next,
-      attacker,
-      atk.defendingPlayerId,
-      power,
-      atk.defendingPlaneswalkerId,
-    );
-    return power;
-  }
+  const manual = next.combat?.damageAssign?.[attacker.id];
+  const plan = manual || defaultDamageAssign(next, attacker, atk, power);
 
-  const living: CardInstance[] = [];
-  for (const blockerId of atk.blockers) {
-    const bf = findCard(next, blockerId);
-    if (!bf || bf.zone !== 'battlefield') continue;
-    const blocker = bf.player.battlefield.find((c) => c.id === blockerId);
-    if (blocker) living.push(blocker);
-  }
-  if (living.length === 0) {
-    if (hasKeyword(attacker, 'trample')) {
-      dealCombatToPlayer(
-        next,
-        attacker,
-        atk.defendingPlayerId,
-        power,
-        atk.defendingPlaneswalkerId,
-      );
-      return power;
-    }
-    return 0;
-  }
-
-  const trample = hasKeyword(attacker, 'trample');
-  let remaining = power;
   let dealt = 0;
-  for (let i = 0; i < living.length; i++) {
-    const blocker = living[i];
-    const isLast = i === living.length - 1;
-    if (remaining <= 0) break;
-    const need = lethalNeeded(attacker, blocker, next);
-    const toBlocker = trample
-      ? Math.min(remaining, need)
-      : isLast
-        ? remaining
-        : Math.min(remaining, need);
-    const actual = dealDamageToCreature(next, attacker, blocker, toBlocker);
-    remaining -= toBlocker;
-    dealt += actual;
+  for (const [blockerId, amt] of Object.entries(plan.toBlockers)) {
+    if (amt <= 0) continue;
+    const bf = findCard(next, blockerId);
+    const blocker =
+      bf?.zone === 'battlefield'
+        ? bf.player.battlefield.find((c) => c.id === blockerId)
+        : undefined;
+    if (!blocker) continue;
+    dealt += dealDamageToCreature(next, attacker, blocker, amt);
   }
-
-  if (remaining > 0 && trample) {
+  if (plan.toPlayer > 0) {
     dealCombatToPlayer(
       next,
       attacker,
       atk.defendingPlayerId,
-      remaining,
+      plan.toPlayer,
       atk.defendingPlaneswalkerId,
     );
-    dealt += remaining;
+    dealt += plan.toPlayer;
   }
   return dealt;
+}
+
+/** Prefill lethal assignment and wait for Confirm (Arena). */
+export function startDamageAssign(state: GameState, wave: Wave): GameState {
+  const next = clonePlayers(state);
+  const combat = ensureCombat(next);
+  const assigned = new Set(combat.assignedFirstWave);
+  const draft: Record<string, DamageAssignEntry> = {};
+  const apId = next.players[next.activePlayerIndex]?.id || null;
+
+  for (const atk of combat.attackers) {
+    const af = findCard(next, atk.attackerId);
+    const attacker =
+      af?.zone === 'battlefield'
+        ? af.player.battlefield.find((c) => c.id === atk.attackerId)
+        : undefined;
+    if (!attacker || !shouldAssignThisWave(attacker, wave, assigned)) continue;
+    const power = effectivePower(attacker, next);
+    draft[attacker.id] = defaultDamageAssign(next, attacker, atk, power);
+  }
+
+  next.combat = {
+    ...combat,
+    mode: 'assignDamage',
+    declaringPlayerId: apId,
+    damageAssign: draft,
+    assignWave: wave,
+    focusAttackerId: Object.keys(draft)[0] || combat.focusAttackerId,
+  };
+  next.consecutivePasses = 0;
+  next.priorityPlayerIndex = next.activePlayerIndex;
+  return next;
+}
+
+export function setDamageAssignAmount(
+  state: GameState,
+  attackerId: string,
+  target: { kind: 'blocker'; blockerId: string } | { kind: 'player' },
+  amount: number,
+): GameState {
+  if (state.combat?.mode !== 'assignDamage') return state;
+  const next = clonePlayers(state);
+  const combat = ensureCombat(next);
+  const cur = combat.damageAssign?.[attackerId] || { toBlockers: {}, toPlayer: 0 };
+  const entry: DamageAssignEntry = {
+    toBlockers: { ...cur.toBlockers },
+    toPlayer: cur.toPlayer,
+  };
+  const n = Math.max(0, Math.floor(amount));
+  if (target.kind === 'blocker') entry.toBlockers[target.blockerId] = n;
+  else entry.toPlayer = n;
+  next.combat = {
+    ...combat,
+    damageAssign: { ...(combat.damageAssign || {}), [attackerId]: entry },
+    focusAttackerId: attackerId,
+  };
+  return next;
+}
+
+/** Confirm assignment → deal the pending wave. */
+export function confirmDamageAssign(state: GameState): GameState {
+  if (state.combat?.mode !== 'assignDamage') return state;
+  const wave = state.combat.assignWave || 'normal';
+  return applyCombatDamageWave(state, wave);
 }
 
 function dealFromCreature(
@@ -801,11 +905,14 @@ export function applyCombatDamageWave(state: GameState, wave: Wave): GameState {
 /** Entry from turn.ts when entering combatDamage — first wave if FS/DS present. */
 export function applyCombatDamage(state: GameState): GameState {
   const needsSplit = combatNeedsFirstStrikeWave(state);
-  return applyCombatDamageWave(state, needsSplit ? 'first' : 'normal');
+  const wave: Wave = needsSplit ? 'first' : 'normal';
+  if (needsManualDamageAssign(state, wave)) return startDamageAssign(state, wave);
+  return applyCombatDamageWave(state, wave);
 }
 
 /** After priority ends first damage step — run normal wave, stay on combatDamage. */
 export function applySecondCombatDamageWave(state: GameState): GameState {
+  if (needsManualDamageAssign(state, 'normal')) return startDamageAssign(state, 'normal');
   return applyCombatDamageWave(state, 'normal');
 }
 
@@ -824,13 +931,7 @@ export function clearCombat(state: GameState): GameState {
 export function legalAttackers(state: GameState): string[] {
   const active = ap(state);
   if (!active) return [];
-  return active.battlefield
-    .filter((c) => {
-      if (!isCreature(c) || c.tapped || hasKeyword(c, 'defender')) return false;
-      if (c.summoningSick && !hasKeywordState(c, 'haste', state)) return false;
-      return true;
-    })
-    .map((c) => c.id);
+  return active.battlefield.filter((c) => canAttack(c, state)).map((c) => c.id);
 }
 
 export function legalBlockers(state: GameState, attackerId?: string): string[] {
@@ -859,5 +960,5 @@ export function legalBlockers(state: GameState, attackerId?: string): string[] {
 
 export function isCombatDeclaring(state: GameState): boolean {
   const m = state.combat?.mode;
-  return m === 'declareAttackers' || m === 'declareBlockers';
+  return m === 'declareAttackers' || m === 'declareBlockers' || m === 'assignDamage';
 }

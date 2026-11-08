@@ -23,32 +23,65 @@ export function cardToCardData(card: Card): CardData {
     toughness: card.toughness,
     colors: identity.filter((c) => c !== 'C'),
     color_identity: identity,
-    keywords: [],
+    keywords: card.keywords || [],
+    image_uri: card.image_uri,
   };
 }
 
 export type StoredDeck = {
   name?: string;
   commander: Card;
+  partner?: Card | null;
+  companion?: Card | null;
   cards: Card[];
 };
 
-function toEngineDeck(deck: StoredDeck): { commander: CardData; cards: CardData[] } {
+function toEngineDeck(deck: StoredDeck): {
+  commander: CardData;
+  partner?: CardData;
+  companion?: CardData;
+  cards: CardData[];
+} {
   const commander = cardToCardData(deck.commander);
+  const partner = deck.partner ? cardToCardData(deck.partner) : undefined;
+  const companion = deck.companion ? cardToCardData(deck.companion) : undefined;
   const cards = deck.cards.map(cardToCardData);
-  if (!cards.some((c) => c.oracle_id === commander.oracle_id)) {
-    cards.unshift(commander);
-  }
-  return { commander, cards };
+  const ids = new Set(cards.map((c) => c.oracle_id));
+  if (!ids.has(commander.oracle_id)) cards.unshift(commander);
+  if (partner && !ids.has(partner.oracle_id)) cards.unshift(partner);
+  return { commander, partner, companion, cards };
 }
 
 /** Player deck vs demo opponent. */
 export function createGameFromPlayerDeck(deck: StoredDeck, playerName = 'Honza'): GameState {
-  const { commander, cards } = toEngineDeck(deck);
+  const { commander, partner, companion, cards } = toEngineDeck(deck);
   return createInitialGameState([
-    { playerId: 'p1', playerName, commander, cards },
+    { playerId: 'p1', playerName, commander, partner, companion, cards },
     getDemoOpponentDeck(),
   ]);
+}
+
+function seatDeck(
+  seat: string,
+  entry: { deck: StoredDeck | 'demo'; name: string },
+  demo: 'host' | 'opp',
+) {
+  const host = getDemoHostDeck();
+  const opp = getDemoOpponentDeck();
+  const base = demo === 'host' ? host : opp;
+  if (entry.deck === 'demo') {
+    return {
+      playerId: seat,
+      playerName: entry.name,
+      commander: base.commander,
+      cards: base.cards,
+    };
+  }
+  return {
+    playerId: seat,
+    playerName: entry.name,
+    ...toEngineDeck(entry.deck),
+  };
 }
 
 /** Online 2P: custom deck nebo demo na každé straně. */
@@ -56,37 +89,34 @@ export function createGameFromTwoDecks(
   p1: { deck: StoredDeck | 'demo'; name: string },
   p2: { deck: StoredDeck | 'demo'; name: string },
 ): GameState {
-  const host = getDemoHostDeck();
-  const opp = getDemoOpponentDeck();
-  const left =
-    p1.deck === 'demo'
-      ? {
-          playerId: 'p1' as const,
-          playerName: p1.name,
-          commander: host.commander,
-          cards: host.cards,
-        }
-      : {
-          playerId: 'p1' as const,
-          playerName: p1.name,
-          ...toEngineDeck(p1.deck),
-        };
+  return createGameFromSeats([
+    { seat: 'p1', ...p1 },
+    { seat: 'p2', ...p2 },
+  ]);
+}
 
-  const right =
-    p2.deck === 'demo'
-      ? {
-          playerId: 'p2' as const,
-          playerName: p2.name,
-          commander: opp.commander,
-          cards: opp.cards,
-        }
-      : {
-          playerId: 'p2' as const,
-          playerName: p2.name,
-          ...toEngineDeck(p2.deck),
-        };
-
-  return createInitialGameState([left, right]);
+/** Online 2–4P EDH seats. */
+export function createGameFromSeats(
+  seats: { seat: string; deck: StoredDeck | 'demo'; name: string }[],
+): GameState {
+  if (seats.length < 2) {
+    throw new Error('Need at least 2 players');
+  }
+  const players = seats.map((s, i) => {
+    if (s.deck !== 'demo' && typeof s.deck === 'object') {
+      const d = toEngineDeck(s.deck);
+      return {
+        playerId: s.seat,
+        playerName: s.name,
+        commander: d.commander,
+        partner: d.partner,
+        companion: d.companion,
+        cards: d.cards,
+      };
+    }
+    return seatDeck(s.seat, s, i === 0 ? 'host' : 'opp');
+  });
+  return createInitialGameState(players);
 }
 
 export function isValidStoredDeck(raw: unknown): raw is StoredDeck {

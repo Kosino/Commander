@@ -1,5 +1,6 @@
 import { GameState, StackObject } from './types';
 import { checkStateBasedActions } from './sba';
+import { flushWaitingTriggers } from './triggers';
 import { advanceStep } from './turn';
 import { clonePlayers } from './zones';
 
@@ -17,6 +18,7 @@ function nextAlivePriorityIndex(state: GameState, from: number): number {
  */
 export function givePriority(state: GameState, playerIndex: number): GameState {
   let next = checkStateBasedActions(state);
+  next = flushWaitingTriggers(next);
   if (next.pendingChoices.length > 0) {
     return { ...next, stateBasedActionsPending: true };
   }
@@ -55,8 +57,14 @@ export function registerStackResolver(fn: (state: GameState) => GameState): void
  */
 export function passPriority(state: GameState): GameState {
   if (state.pendingCast) return state;
-  if (state.combat?.mode === 'declareAttackers' || state.combat?.mode === 'declareBlockers') {
-    return state; // Arena: must Confirm declaration first
+  if (state.pendingLoyalty) return state;
+  if (state.pendingActivated) return state;
+  if (
+    state.combat?.mode === 'declareAttackers' ||
+    state.combat?.mode === 'declareBlockers' ||
+    state.combat?.mode === 'assignDamage'
+  ) {
+    return state; // Arena: must Confirm declaration / damage assign first
   }
   if (state.pendingChoices.length > 0) return state;
   if (state.winnerId) return state;

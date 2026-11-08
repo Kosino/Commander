@@ -3,6 +3,8 @@
  * Plays lands, casts cheap spells, attacks, blocks flying with reach.
  */
 import { playLand } from './actions';
+import { beginActivatedIndex, beginLoyalty } from './abilities';
+import { resolveTriggerOrder } from './triggers';
 import {
   activateManaAbility,
   beginCast,
@@ -19,12 +21,18 @@ import {
   canBlock,
   confirmAttackers,
   confirmBlockers,
+  confirmDamageAssign,
   legalAttackers,
   toggleDraftAttacker,
   toggleDraftBlocker,
 } from './combat';
 import { givePriority, passPriority } from './priority';
 import {
+  resolveMulliganBottom,
+  resolveMulliganKeep,
+} from './mulligan';
+import {
+  resolveCommanderZoneChoice,
   resolveDiscardSelect,
   resolveFabricateChoice,
   resolveLookAtTopChoice,
@@ -164,6 +172,32 @@ function effectiveThreat(c: { card: { power?: string } }): number {
 export function runDemoAi(state: GameState): GameState {
   if (state.winnerId) return state;
 
+  if (state.combat?.mode === 'assignDamage') {
+    const ap = state.players[state.activePlayerIndex];
+    if (ap?.id === AI_ID) return confirmDamageAssign(state);
+  }
+
+  if (state.pendingLoyalty?.playerId === AI_ID) {
+    return beginLoyalty(state, AI_ID, state.pendingLoyalty.permanentId, 0);
+  }
+
+  if (state.pendingActivated?.playerId === AI_ID) {
+    const idx = state.pendingActivated.options[0];
+    return beginActivatedIndex(
+      state,
+      AI_ID,
+      state.pendingActivated.permanentId,
+      idx ?? 0,
+    );
+  }
+
+  const orderChoice = state.pendingChoices.find(
+    (c) => c.type === 'orderTriggers' && c.playerId === AI_ID,
+  );
+  if (orderChoice && orderChoice.type === 'orderTriggers') {
+    return resolveTriggerOrder(state, orderChoice.triggerIds);
+  }
+
   const pending = state.pendingCast;
   if (pending) {
     if (pending.playerId !== AI_ID) return state;
@@ -201,6 +235,8 @@ export function runDemoAi(state: GameState): GameState {
         R: 0,
         G: 0,
         C: 0,
+        hybrids: [],
+        phyrexian: [],
         unpayable: false,
       };
       const can = me && (choice.cost === 0 || canPayMana(me.manaPool, cost));
@@ -231,7 +267,16 @@ export function runDemoAi(state: GameState): GameState {
       const ids = (me?.battlefield || []).slice(0, choice.amount).map((c) => c.id);
       return resolveSacrificePermanents(state, ids);
     }
-    if (choice.type === 'legend' || choice.type === 'commanderToCommandZone') {
+    if (choice.type === 'mulligan') {
+      if (choice.phase === 'decide') return resolveMulliganKeep(state, AI_ID);
+      const me = state.players.find((p) => p.id === AI_ID);
+      const ids = (me?.hand || []).slice(0, choice.mulligansTaken).map((c) => c.id);
+      return resolveMulliganBottom(state, AI_ID, ids);
+    }
+    if (choice.type === 'commanderToCommandZone') {
+      return resolveCommanderZoneChoice(state, choice.cardId, true);
+    }
+    if (choice.type === 'legend') {
       return state;
     }
   }

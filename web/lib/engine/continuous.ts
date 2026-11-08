@@ -57,6 +57,15 @@ export function continuousPtBonus(
           toughness += parseInt(all[2], 10);
         }
       }
+      // "Creatures your opponents control get -N/-N"
+      const opp = text.match(
+        /creatures\s+your\s+opponents\s+control\s+get\s+([+-]\d+)\/([+-]\d+)/i,
+      );
+      if (opp && src.controller !== ctrl) {
+        power += parseInt(opp[1], 10);
+        toughness += parseInt(opp[2], 10);
+      }
+
       // "Artifact creatures you control get +N/+N"
       const art = text.match(
         /artifact\s+creatures\s+you\s+control\s+get\s+([+-]\d+)\/([+-]\d+)/i,
@@ -86,6 +95,23 @@ export function continuousPtBonus(
       }
     }
   }
+  // Self static "~ gets +N/+N" / "CARDNAME gets +N/+N" (not attachment text)
+  {
+    const selfText = c.card.oracle_text || '';
+    const self = selfText.match(
+      /(?:^|\n)\s*(?:~|this\s+creature|[A-Z][\w']*(?:\s+[A-Z][\w']*)*)\s+gets?\s+([+-]\d+)\/([+-]\d+)(?!\s+until)/i,
+    );
+    // Skip if it's "Enchanted/Equipped creature gets" on this card (Aura/Equip — applied via attachment)
+    if (
+      self &&
+      !/enchanted|equipped/i.test(self[0]) &&
+      !/creatures?\s+you\s+control/i.test(self[0])
+    ) {
+      power += parseInt(self[1], 10);
+      toughness += parseInt(self[2], 10);
+    }
+  }
+
   // Emblem continuous P/T (rare, but "creatures you control get")
   const owner = state.players.find((p) => p.id === ctrl);
   for (const emb of owner?.emblems || []) {

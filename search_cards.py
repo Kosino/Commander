@@ -23,6 +23,7 @@ def search(query: str, limit: int = 20):
                     "toughness": card.get("toughness"),
                     "color_identity": card.get("color_identity"),
                     "oracle_id": card.get("oracle_id"),
+                    "keywords": card.get("keywords") or [],
                 })
                 if len(results) >= limit:
                     break

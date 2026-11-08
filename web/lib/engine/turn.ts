@@ -47,7 +47,13 @@ function untapActivePlayer(state: GameState): GameState {
   const player = next.players[next.activePlayerIndex];
   if (!player) return next;
   for (const perm of player.battlefield) {
-    perm.tapped = false;
+    // Stun counter (122.1d): would untap → remove stun instead
+    if (perm.tapped && (perm.counters['stun'] || 0) > 0) {
+      perm.counters['stun'] = (perm.counters['stun'] || 0) - 1;
+      if (perm.counters['stun'] <= 0) delete perm.counters['stun'];
+    } else {
+      perm.tapped = false;
+    }
     perm.summoningSick = false;
   }
   return next;
@@ -100,7 +106,7 @@ function nextAliveActiveIndex(state: GameState): number {
   return state.activePlayerIndex;
 }
 
-function beginNextTurn(state: GameState): GameState {
+export function beginNextTurn(state: GameState): GameState {
   let next = emptyAllManaPools(state);
   next = clearCombat(next);
   next.consecutivePasses = 0;
@@ -117,6 +123,7 @@ function beginNextTurn(state: GameState): GameState {
   next.turnNumber += 1;
   const ap = next.players[next.activePlayerIndex];
   next.creatureDiedThisTurn = false;
+  next.creaturesDiedThisTurn = 0;
   next.spellsCastThisTurn = 0;
   next.preventCombatDamageThisTurn = false;
   next.preventAllDamageThisTurn = false;

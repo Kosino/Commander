@@ -154,7 +154,10 @@ export function moveCard(
         card.tapped = false;
         if (dest !== 'exile') card.unearthed = false;
       }
-      if (card.isCommander && (dest === 'graveyard' || dest === 'exile')) {
+      if (
+        card.isCommander &&
+        (dest === 'graveyard' || dest === 'exile' || dest === 'hand' || dest === 'library')
+      ) {
         card.commanderRelocationPending = true;
       }
       if (dest === 'command') {

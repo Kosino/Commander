@@ -1,5 +1,5 @@
 /**
- * Triggered abilities — queue onto the stack (CR 603), then priority.
+ * Triggered abilities ÔÇö queue onto the stack (CR 603), then priority.
  * Targeted triggers use pendingCast.from==='trigger' before stacking.
  */
 import {
@@ -23,6 +23,7 @@ import {
   GameState,
   isCreature,
   StackObject,
+  WaitingTrigger,
 } from './types';
 import { clonePlayers } from './zones';
 import { afterPlayerAction } from './priority';
@@ -39,7 +40,117 @@ export function nextDelayId(): string {
   return `delay_${_delaySeq}`;
 }
 
-/** Put a triggered ability on the stack (top). */
+function apnapPlayerIds(state: GameState): string[] {
+  const n = state.players.length;
+  const start = state.activePlayerIndex;
+  const ids: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const p = state.players[(start + i) % n];
+    if (p && !p.hasLost) ids.push(p.id);
+  }
+  return ids;
+}
+
+function putWaitingOnStack(state: GameState, t: WaitingTrigger): GameState {
+  const next = clonePlayers(state);
+  next.stack = [
+    ...next.stack,
+    {
+      id: t.id,
+      kind: 'trigger',
+      controller: t.controllerId,
+      name: t.name,
+      sourcePermanentId: t.sourcePermanentId,
+      targets: t.targets || {},
+      script: t.script,
+    },
+  ];
+  next.consecutivePasses = 0;
+  return next;
+}
+
+/** CR 603.3b — buffer → stack in APNAP order; multi → orderTriggers choice. */
+export function flushWaitingTriggers(state: GameState): GameState {
+  if (state.pendingCast) return state;
+  if (state.pendingChoices.some((c) => c.type === 'orderTriggers')) return state;
+
+  let next = state;
+  let waiting = [...(next.waitingTriggers || [])];
+  if (waiting.length === 0) return next;
+
+  for (const pid of apnapPlayerIds(next)) {
+    const mine = waiting.filter((t) => t.controllerId === pid);
+    if (mine.length === 0) continue;
+    if (mine.length === 1) {
+      next = putWaitingOnStack(next, mine[0]);
+      waiting = waiting.filter((t) => t.id !== mine[0].id);
+      next = { ...next, waitingTriggers: waiting };
+      continue;
+    }
+    next = {
+      ...next,
+      waitingTriggers: waiting,
+      pendingChoices: [
+        ...next.pendingChoices,
+        {
+          type: 'orderTriggers',
+          playerId: pid,
+          triggerIds: mine.map((t) => t.id),
+        },
+      ],
+    };
+    return next;
+  }
+  return { ...next, waitingTriggers: waiting };
+}
+
+/** orderedIds = resolve order (first resolves first). */
+export function resolveTriggerOrder(state: GameState, orderedIds: string[]): GameState {
+  const choice = state.pendingChoices.find((c) => c.type === 'orderTriggers');
+  if (!choice || choice.type !== 'orderTriggers') return state;
+
+  const waiting = [...(state.waitingTriggers || [])];
+  const ids =
+    orderedIds.length > 0 ? orderedIds : choice.triggerIds;
+
+  let next: GameState = {
+    ...state,
+    pendingChoices: state.pendingChoices.filter((c) => c !== choice),
+  };
+  for (const id of [...ids].reverse()) {
+    const t = waiting.find((x) => x.id === id);
+    if (!t) continue;
+    next = putWaitingOnStack(next, t);
+    next.waitingTriggers = (next.waitingTriggers || []).filter((x) => x.id !== id);
+  }
+  return flushWaitingTriggers(next);
+}
+
+function enqueueWaiting(
+  state: GameState,
+  opts: {
+    controllerId: string;
+    name: string;
+    sourcePermanentId?: string;
+    script: SpellScript;
+    targets?: StackObject['targets'];
+  },
+): GameState {
+  const next = clonePlayers(state);
+  const wt: WaitingTrigger = {
+    id: nextTrigId(),
+    controllerId: opts.controllerId,
+    name: opts.name,
+    sourcePermanentId: opts.sourcePermanentId,
+    script: opts.script,
+    targets: opts.targets,
+  };
+  next.waitingTriggers = [...(next.waitingTriggers || []), wt];
+  next.consecutivePasses = 0;
+  return flushWaitingTriggers(next);
+}
+
+/** Put a triggered ability on the stack (via APNAP buffer). */
 export function queueTrigger(
   state: GameState,
   opts: {
@@ -58,19 +169,7 @@ export function queueTrigger(
   if (opts.script.targets.length > 0 && !opts.targets) {
     return beginTriggerTargeting(state, opts);
   }
-  const next = clonePlayers(state);
-  const obj: StackObject = {
-    id: nextTrigId(),
-    kind: 'trigger',
-    controller: opts.controllerId,
-    name: opts.name,
-    sourcePermanentId: opts.sourcePermanentId,
-    targets: opts.targets || {},
-    script: opts.script,
-  };
-  next.stack = [...next.stack, obj];
-  next.consecutivePasses = 0;
-  return next;
+  return enqueueWaiting(state, opts);
 }
 
 /** Start targeting for a triggered ability (pendingCast.from = trigger). */
@@ -84,12 +183,12 @@ export function beginTriggerTargeting(
   },
 ): GameState {
   if (state.pendingCast) {
-    // Already choosing something — queue without targets (fizzle illegal later)
+    // Already choosing something ÔÇö queue without targets (fizzle illegal later)
     return queueTriggerDirect(state, opts, {});
   }
   for (const slot of opts.script.targets) {
     if (listLegalTargets(state, slot.filter, opts.controllerId).length === 0) {
-      // No legal targets — trigger removed (603.3d MVP: don't put on stack)
+      // No legal targets ÔÇö trigger removed (603.3d MVP: don't put on stack)
       return state;
     }
   }
@@ -128,24 +227,10 @@ function queueTriggerDirect(
   },
   targets: NonNullable<StackObject['targets']>,
 ): GameState {
-  const next = clonePlayers(state);
-  next.stack = [
-    ...next.stack,
-    {
-      id: nextTrigId(),
-      kind: 'trigger',
-      controller: opts.controllerId,
-      name: opts.name,
-      sourcePermanentId: opts.sourcePermanentId,
-      targets,
-      script: opts.script,
-    },
-  ];
-  next.consecutivePasses = 0;
-  return next;
+  return enqueueWaiting(state, { ...opts, targets });
 }
 
-/** Finish trigger targeting → put on stack. */
+/** Finish trigger targeting ÔåÆ put on stack. */
 export function finalizeTriggerTargets(
   state: GameState,
   targets: Record<string, import('./effects').TargetRef>,
@@ -339,7 +424,7 @@ export function fireCastNoncreatureTriggers(
   return next;
 }
 
-/** "Whenever you cast a spell" — any spell including creatures. */
+/** "Whenever you cast a spell" ÔÇö any spell including creatures. */
 export function fireCastAnySpellTriggers(state: GameState, casterId: string): GameState {
   let next = state;
   const p = next.players.find((x) => x.id === casterId);
@@ -357,7 +442,7 @@ export function fireCastAnySpellTriggers(state: GameState, casterId: string): Ga
   return next;
 }
 
-/** ETB — targeted or targetless via parseEtbScript. Evoke → also sac self. */
+/** ETB ÔÇö targeted or targetless via parseEtbScript. Evoke ÔåÆ also sac self. */
 export function fireEtbTriggers(
   state: GameState,
   controllerId: string,

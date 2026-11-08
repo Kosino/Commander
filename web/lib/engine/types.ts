@@ -2,7 +2,8 @@
 // Vázáno na docs/rulebook.md a Comprehensive Rules 2026
 
 import type { SpellScript, TargetRef, TargetSlot } from './effects';
-import { continuousPtBonus } from './continuous';
+// SpellScript used by WaitingTrigger / DelayedTrigger
+import { continuousPtBonus, hasKeywordState } from './continuous';
 
 export type ManaColor = 'W' | 'U' | 'B' | 'R' | 'G' | 'C';
 
@@ -27,6 +28,8 @@ export interface CardData {
   colors: ManaColor[];
   color_identity: ManaColor[];
   keywords: string[];
+  /** Optional Scryfall art URL (or named-image endpoint). */
+  image_uri?: string;
 }
 
 export interface CardInstance {
@@ -44,9 +47,11 @@ export interface CardInstance {
   deathtouchSinceLastSba: boolean;
   isCommander: boolean;
   commanderCastCount: number;
+  /** Companion (702.124) — cast once from command; not a commander. */
+  isCompanion?: boolean;
   /** True for token permanents (704.5d). */
   isToken?: boolean;
-  /** 704.6d — put into GY/exile since last SBA; owner may move to command zone. */
+  /** 704.6d / 903.9 — put into GY/exile/hand/library; owner may move to command zone. */
   commanderRelocationPending?: boolean;
   /** Summoning sickness until controller's next untap (508.1a); haste ignores. */
   summoningSick: boolean;
@@ -116,6 +121,8 @@ export interface Player {
   lostLifeThisTurn: boolean;
   /** Pending extra turns (CR 500.7) — taken before opponent. */
   extraTurns?: number;
+  /** London mulligans taken this game (bottom N after keep). */
+  mulligansTaken?: number;
   /** Emblems (114) — command-zone-like continuous/triggered text. */
   emblems?: { id: string; name: string; oracle_text: string }[];
   /** Experience counters (122.1b / Planechase-style on player). */
@@ -164,6 +171,8 @@ export interface StackObject {
   /** Chosen targets (Arena: declared during cast). */
   targets?: Record<string, TargetRef>;
   script?: SpellScript;
+  /** Source colors for protection checks on resolve. */
+  sourceColors?: ManaColor[];
 }
 
 /**
@@ -202,6 +211,10 @@ export type PendingCast = {
   sourceColors?: ManaColor[];
   /** Ability/loyalty script when from==='ability' (avoids re-parse). */
   abilityScript?: SpellScript;
+  /** Activated ability requires tapping the source. */
+  abilityNeedsTap?: boolean;
+  /** Mana already paid for activated ability (non-tap). */
+  abilityManaPaid?: boolean;
   /** Crew: tapped creature ids so far / needed power. */
   crewNeeded?: number;
   crewTapped?: string[];
@@ -290,7 +303,15 @@ export type PendingChoice =
       type: 'commanderToCommandZone';
       playerId: string;
       cardId: string;
-      from: 'graveyard' | 'exile';
+      from: 'graveyard' | 'exile' | 'hand' | 'library';
+    }
+  | {
+      /** London mulligan (903.4 / CR 103.5) — decide keep or take another. */
+      type: 'mulligan';
+      playerId: string;
+      /** How many mulligans already taken (0 = opening hand). */
+      mulligansTaken: number;
+      phase: 'decide' | 'bottom';
     }
   | {
       type: 'ward';
@@ -334,6 +355,13 @@ export type PendingChoice =
       playerId: string;
       permanentId: string;
       amount: number;
+    }
+  | {
+      /** CR 603.3b — order simultaneous triggers you control. */
+      type: 'orderTriggers';
+      playerId: string;
+      /** Waiting trigger ids (default APNAP / timestamp order). */
+      triggerIds: string[];
     };
 
 export interface GameState {
@@ -352,12 +380,25 @@ export interface GameState {
   winnerId: string | null;
   /** In-progress cast targeting (Arena GRE-style prompt). */
   pendingCast: PendingCast | null;
+  /** Planeswalker loyalty ability picker (multiple +/−/0). */
+  pendingLoyalty?: { playerId: string; permanentId: string } | null;
+  /** Activated ability picker when permanent has several. */
+  pendingActivated?: {
+    playerId: string;
+    permanentId: string;
+    /** Indices into parseActivatedAbilities(). */
+    options: number[];
+  } | null;
+  /** Simultaneous triggers waiting to be ordered onto the stack (603.3b). */
+  waitingTriggers?: WaitingTrigger[];
   /** Combat declaration / assignments (Arena combat UI). */
   combat: CombatState | null;
   /** The Monarch (702.138). */
   monarchPlayerId: string | null;
   /** Creature died this turn (morbid). */
   creatureDiedThisTurn: boolean;
+  /** How many creatures died this turn (for equal-to draw). */
+  creaturesDiedThisTurn?: number;
   /** Spells cast this turn (storm count; current spell not yet counted when checked). */
   spellsCastThisTurn: number;
   /** Active prevention shields (615). */
@@ -371,6 +412,16 @@ export interface GameState {
   /** Delayed triggered abilities (603.7) — fire at named step. */
   delayedTriggers: DelayedTrigger[];
 }
+
+/** Triggered ability waiting for APNAP order before stacking. */
+export type WaitingTrigger = {
+  id: string;
+  controllerId: string;
+  name: string;
+  sourcePermanentId?: string;
+  script: SpellScript;
+  targets?: Record<string, import('./effects').TargetRef>;
+};
 
 /** Delayed trigger created by resolving spell/ability. */
 export type DelayedTrigger = {
@@ -398,11 +449,19 @@ export type AttackerDecl = {
  * Arena-like combat: declare → confirm TBA → priority.
  * `draft*` = výběr před potvrzením (jako Arena highlight + Confirm).
  */
+/** Per-attacker combat damage assignment (510.1c / Arena). */
+export type DamageAssignEntry = {
+  /** blockerId → damage */
+  toBlockers: Record<string, number>;
+  /** Trample / unblocked remainder to player or PW. */
+  toPlayer: number;
+};
+
 export type CombatState = {
   attackers: AttackerDecl[];
   /** Who is choosing (AP for attackers, defending player for blockers). */
   declaringPlayerId: string | null;
-  mode: 'idle' | 'declareAttackers' | 'declareBlockers' | null;
+  mode: 'idle' | 'declareAttackers' | 'declareBlockers' | 'assignDamage' | null;
   /** Draft selection before Confirm. */
   draftAttackerIds: string[];
   /** defender assigns: attackerId → blockerIds */
@@ -420,6 +479,10 @@ export type CombatState = {
   damageWave: 'first' | 'normal' | null;
   /** Creature ids that assigned damage in the first wave (FS without DS skip second). */
   assignedFirstWave: string[];
+  /** Manual damage assignment draft (active player). */
+  damageAssign?: Record<string, DamageAssignEntry>;
+  /** Which wave the current assignDamage prompt is for. */
+  assignWave?: 'first' | 'normal' | null;
 };
 
 export function emptyManaPool(): Record<ManaColor, number> {
@@ -500,10 +563,13 @@ export function effectiveToughness(c: CardInstance, state?: GameState): number |
   return base + (c.tempToughness || 0) + plus - minus + att.toughness + cont.toughness;
 }
 
-export function canAttack(c: CardInstance): boolean {
+export function canAttack(c: CardInstance, state?: GameState): boolean {
   if (!isCreature(c) || c.tapped) return false;
-  if (hasKeyword(c, 'defender')) return false;
-  if (c.summoningSick && !hasKeyword(c, 'haste')) return false;
+  const text = (c.card.oracle_text || '').toLowerCase();
+  if (/\bcan't attack\b/.test(text) || /\bcannot attack\b/.test(text)) return false;
+  if (state ? hasKeywordState(c, 'defender', state) : hasKeyword(c, 'defender')) return false;
+  const haste = state ? hasKeywordState(c, 'haste', state) : hasKeyword(c, 'haste');
+  if (c.summoningSick && !haste) return false;
   return true;
 }
 
@@ -520,6 +586,8 @@ export function emptyCombat(): CombatState {
     focusAttackerId: null,
     damageWave: null,
     assignedFirstWave: [],
+    damageAssign: {},
+    assignWave: null,
   };
 }
 

@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import {
   applyRoomAction,
   authSeat,
-  getRoom,
+  getRoomAsync,
   viewForSeat,
   type RoomAction,
-  type SeatId,
 } from '../../../../../lib/server/rooms';
+import { isSeatId } from '../../../../../lib/onlineTypes';
 
 /** POST { seat, token, action } */
 export async function POST(
@@ -15,18 +15,18 @@ export async function POST(
 ) {
   const { id } = await ctx.params;
   const body = await req.json().catch(() => ({}));
-  const seat = body.seat as SeatId;
+  const seat = body.seat;
   const token = typeof body.token === 'string' ? body.token : '';
   const action = body.action as RoomAction;
 
-  if (seat !== 'p1' && seat !== 'p2') {
+  if (!isSeatId(seat)) {
     return NextResponse.json({ error: 'seat required' }, { status: 400 });
   }
   if (!action || typeof action.type !== 'string') {
     return NextResponse.json({ error: 'action required' }, { status: 400 });
   }
 
-  const room = getRoom(id);
+  const room = await getRoomAsync(id);
   if (!room) return NextResponse.json({ error: 'Room not found' }, { status: 404 });
   if (!authSeat(room, seat, token)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

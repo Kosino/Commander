@@ -1,3 +1,4 @@
+import { beginMulligans } from './mulligan';
 import {
   CardData,
   CardInstance,
@@ -48,15 +49,43 @@ export function makeInstance(
 
 /** Nastaví hru: life 40, commander do command zone, zbytek zamíchaná library, 7 do ruky. */
 export function createInitialGameState(
-  decks: { playerId: string; playerName?: string; cards: CardData[]; commander: CardData }[],
+  decks: {
+    playerId: string;
+    playerName?: string;
+    cards: CardData[];
+    commander: CardData;
+    partner?: CardData;
+    companion?: CardData;
+  }[],
 ): GameState {
   const players: Player[] = decks.map((d) => {
     const commander = makeInstance(d.commander, d.playerId, 'command', { isCommander: true });
+    const commandZone = [commander];
+    if (d.partner) {
+      commandZone.push(
+        makeInstance(d.partner, d.playerId, 'command', { isCommander: true }),
+      );
+    }
+    if (d.companion) {
+      const comp = makeInstance(d.companion, d.playerId, 'command', {
+        isCommander: false,
+      });
+      comp.isCompanion = true;
+      commandZone.push(comp);
+    }
 
-    const libraryCards = d.cards.filter((c) => c.oracle_id !== d.commander.oracle_id);
+    const skipIds = new Set(
+      [d.commander, d.partner, d.companion]
+        .filter(Boolean)
+        .map((c) => c!.oracle_id),
+    );
+    const libraryCards = d.cards.filter((c) => !skipIds.has(c.oracle_id));
     const shuffled = shuffle(libraryCards).map((c) => makeInstance(c, d.playerId, 'library'));
     const hand = shuffled.splice(0, 7);
     for (const c of hand) c.zone = 'hand';
+
+    // Partner: color identity = union on both commander cards' identities already on CardData;
+    // cast checks use all isCommander cards' identities via getCommandColorIdentity.
 
     return {
       id: d.playerId,
@@ -68,7 +97,7 @@ export function createInitialGameState(
       battlefield: [],
       graveyard: [],
       exile: [],
-      commandZone: [commander],
+      commandZone,
       manaPool: emptyManaPool(),
       commanderDamage: {},
       attemptedEmptyDraw: false,
@@ -77,6 +106,7 @@ export function createInitialGameState(
       attackedThisTurn: false,
       lostLifeThisTurn: false,
       extraTurns: 0,
+      mulligansTaken: 0,
       emblems: [],
       experience: 0,
       energy: 0,
@@ -84,19 +114,22 @@ export function createInitialGameState(
     };
   });
 
-  return {
+  const base = {
     players,
     activePlayerIndex: 0,
-    phase: 'beginning',
-    step: 'untap',
+    phase: 'beginning' as const,
+    step: 'untap' as const,
     stack: [],
     priorityPlayerIndex: 0,
     consecutivePasses: 0,
     turnNumber: 1,
     stateBasedActionsPending: false,
-    pendingChoices: [],
+    pendingChoices: [] as GameState['pendingChoices'],
     winnerId: null,
     pendingCast: null,
+    pendingLoyalty: null,
+    pendingActivated: null,
+    waitingTriggers: [],
     combat: null,
     monarchPlayerId: null,
     creatureDiedThisTurn: false,
@@ -107,4 +140,5 @@ export function createInitialGameState(
     preventAllDamageThisTurn: false,
     delayedTriggers: [],
   };
+  return beginMulligans(base);
 }

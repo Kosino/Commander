@@ -98,12 +98,17 @@ export function parseManaCost(manaCost?: string, xValue = 0): ManaCost {
   return cost;
 }
 
+/** Generic-only cost (abilities that pay N as colorless). */
+export function genericMana(n: number): ManaCost {
+  return { ...EMPTY, generic: Math.max(0, n), hybrids: [], phyrexian: [] };
+}
+
 /** Add generic mana (commander tax, etc.). */
 export function withExtraGeneric(cost: ManaCost, extra: number): ManaCost {
   return {
     ...cost,
-    hybrids: [...cost.hybrids],
-    phyrexian: [...cost.phyrexian],
+    hybrids: [...(cost.hybrids || [])],
+    phyrexian: [...(cost.phyrexian || [])],
     generic: cost.generic + Math.max(0, extra),
     unpayable: false,
   };

@@ -119,7 +119,21 @@ Herní modul musí:
 - [x] Dies/ETB watchers; equal-to draw/life/damage; emblems; extra turn; tribal/artifact anthems; land from hand.
 - [x] Replacement layers MVP: fog / all-damage prevent, redirect, GY→exile, draw doubling; devotion/domain; experience/energy; look-at / put top-bottom / exile GY.
 - [x] Sagas (lore + chapters); explore; fabricate/support/bolster/backup; renown/training/battalion/bloodthirst/devour; changeling tribal.
-- [ ] Redis multi-instance (online rooms).
+- [x] Critical core closeout: can't attack; continuous hexproof/shroud/haste/defender/menace; color identity on cast; illegal-target fizzle (608.2b); sac cost via moveCard.
+- [x] Arena-style play UI scaffold (felt board, lanes, hand, stack; polish later).
+- [x] Online play uses same ArenaTable layout (SSE rooms; Redis still optional).
+
+## Implementation packages (gaps → balíky)
+Pořadí = priorita pro hratelnost. Každý balík = jeden workstream.
+
+- [x] **P1 Arena DnD UX** — drag&drop: hand→cast/land, BF→attack/block/target, click fallback; drop zóny na stole.
+- [x] **P2 Commander setup** — London mulligan; commander relocate hand/library; Partner + Companion.
+- [x] **P3 Combat & stack UX** — ruční damage assign / trample split; stack jako karty; PW loyalty výběr. (arrows/lanes polish later)
+- [x] **P4 Oracle coverage wave** — nové patterny (opp lose/discard, counters all, GY return, grant KW, tokens); `npm run oracle-coverage`.
+- [x] **P5 Abilities deep** — PW +/−/0 výběr; víc non-tap aktivací; trigger order (APNAP).
+- [x] **P6 Continuous & replacement** — víc CR 613 vrstev; obecnější „if would…“ replacement.
+- [x] **P7 Multiplayer scale** — 3–4 seats EDH; lobby + early start; presence `lastSeen`; Redis via `REDIS_URL` (file fallback).
+- [x] **P8 Deck & polish** — banlist/Game Changers; auto-pass; `smoke-flow`; Scryfall art + zoom.
 
 ---
 

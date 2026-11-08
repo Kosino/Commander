@@ -2,12 +2,14 @@
  * Activated abilities — `{T}: …`, Equip, loyalty, Clue/Food (Arena-like).
  */
 import {
+  parseActivatedAbilities,
   parseAdapt,
   parseCrewCost,
   parseEquipCost,
   parseLoyaltyAbilities,
   parseMonstrosity,
   parseTapAbility,
+  SpellScript,
   TargetRef,
 } from './effects';
 import { canPayMana, parseManaCost, payMana } from './mana';
@@ -73,10 +75,29 @@ export function beginActivate(
   const monst = tryMonstrosity(state, playerId, permanentId);
   if (monst !== state) return monst;
 
-  // Planeswalker: activate first legal loyalty ability (sorcery speed MVP = main, empty stack, AP)
+  // Planeswalker: pick loyalty ability (Arena) — multiple → pendingLoyalty UI
   if (isPlaneswalker(perm)) {
-    const loy = beginLoyalty(state, playerId, permanentId, 0);
-    if (loy !== state) return loy;
+    const abilities = parseLoyaltyAbilities(perm.card.oracle_text);
+    if (abilities.length === 1) {
+      const loy = beginLoyalty(state, playerId, permanentId, 0);
+      if (loy !== state) return loy;
+    } else if (abilities.length > 1) {
+      const ap = state.players[state.activePlayerIndex];
+      const okTiming =
+        state.players[state.priorityPlayerIndex]?.id === playerId &&
+        ap?.id === playerId &&
+        (state.phase === 'main1' || state.phase === 'main2') &&
+        state.stack.length === 0 &&
+        !state.pendingCast &&
+        state.pendingChoices.length === 0;
+      if (okTiming) {
+        return {
+          ...state,
+          pendingLoyalty: { playerId, permanentId },
+          consecutivePasses: 0,
+        };
+      }
+    }
   }
 
   // Clue / Food / Blood — sacrifice activates
@@ -95,30 +116,126 @@ export function beginActivate(
     if (map !== state) return map;
   }
 
-  if (perm.tapped) return state;
-  const script = parseTapAbility(perm.card.oracle_text);
-  if (!script) return state;
+  // Activated abilities: {T}: / {N}: / {T}, {N}:
+  const activated = parseActivatedAbilities(perm.card.oracle_text);
+  const legalIdx: number[] = [];
+  for (let i = 0; i < activated.length; i++) {
+    const ab = activated[i];
+    if (ab.needsTap && perm.tapped) continue;
+    const free = !ab.manaCost;
+    if (!free) {
+      const cost = parseManaCost(ab.manaCost);
+      if (!canPayMana(found.player.manaPool, cost, found.player.life)) continue;
+    }
+    if (
+      ab.script.targets.some(
+        (slot) => listLegalTargets(state, slot.filter, playerId).length === 0,
+      )
+    ) {
+      continue;
+    }
+    legalIdx.push(i);
+  }
 
+  if (legalIdx.length === 0) {
+    // Fallback legacy tap-only
+    if (perm.tapped) return state;
+    const script = parseTapAbility(perm.card.oracle_text);
+    if (!script) return state;
+    return startAbilityPending(state, playerId, permanentId, script, '{T}', true);
+  }
+
+  if (legalIdx.length > 1) {
+    return {
+      ...state,
+      pendingActivated: { playerId, permanentId, options: legalIdx },
+      consecutivePasses: 0,
+    };
+  }
+
+  return beginActivatedIndex(state, playerId, permanentId, legalIdx[0]);
+}
+
+export function cancelActivated(state: GameState): GameState {
+  if (!state.pendingActivated) return state;
+  return { ...state, pendingActivated: null };
+}
+
+/** Activate by index into parseActivatedAbilities(). */
+export function beginActivatedIndex(
+  state: GameState,
+  playerId: string,
+  permanentId: string,
+  abilityIndex: number,
+): GameState {
+  const found = findCard(state, permanentId);
+  if (!found || found.zone !== 'battlefield' || found.player.id !== playerId) return state;
+  const perm = found.player.battlefield.find((c) => c.id === permanentId);
+  if (!perm) return state;
+  const activated = parseActivatedAbilities(perm.card.oracle_text);
+  const ab = activated[abilityIndex];
+  if (!ab) return state;
+  if (ab.needsTap && perm.tapped) return state;
+  const free = !ab.manaCost;
+  if (!free) {
+    const cost = parseManaCost(ab.manaCost);
+    if (!canPayMana(found.player.manaPool, cost, found.player.life)) return state;
+  }
+
+  let next: GameState = { ...state, pendingActivated: null };
+  if (!free) {
+    const cost = parseManaCost(ab.manaCost);
+    const n = clonePlayers(next);
+    const p = n.players.find((x) => x.id === playerId);
+    if (!p) return state;
+    const paid = payMana(p.manaPool, cost, p.life);
+    if (!paid) return state;
+    p.manaPool = paid;
+    next = n;
+  }
+
+  return startAbilityPending(
+    next,
+    playerId,
+    permanentId,
+    ab.script,
+    ab.costLabel,
+    ab.needsTap,
+  );
+}
+
+function startAbilityPending(
+  state: GameState,
+  playerId: string,
+  permanentId: string,
+  script: SpellScript,
+  costLabel: string,
+  needsTap: boolean,
+): GameState {
+  const found = findCard(state, permanentId);
+  const name = found?.card.card.name || 'Ability';
   if (script.targets.length === 0) {
-    return finalizeAbility(state, playerId, permanentId, {}, script);
+    return finalizeAbility(state, playerId, permanentId, {}, script, {
+      needsTap,
+      manaAlreadyPaid: true,
+    });
   }
-  for (const slot of script.targets) {
-    if (listLegalTargets(state, slot.filter, playerId).length === 0) return state;
-  }
-
   return {
     ...state,
+    pendingActivated: null,
     pendingCast: {
       playerId,
       cardId: permanentId,
-      cardName: `${perm.card.name} ({T})`,
+      cardName: `${name} (${costLabel})`,
       slots: script.targets,
       chosen: {},
       currentSlot: 0,
       from: 'ability',
       abilitySourceId: permanentId,
-      sourceColors: perm.card.colors || [],
+      sourceColors: found?.card.card.colors || [],
       abilityScript: script,
+      abilityNeedsTap: needsTap,
+      abilityManaPaid: true,
     },
   };
 }
@@ -214,6 +331,8 @@ function tryAdapt(state: GameState, playerId: string, permanentId: string): Game
     R: 0,
     G: 0,
     C: 0,
+    hybrids: [],
+    phyrexian: [],
     unpayable: false,
   };
   const player = state.players.find((p) => p.id === playerId);
@@ -246,6 +365,8 @@ function tryMonstrosity(state: GameState, playerId: string, permanentId: string)
     R: 0,
     G: 0,
     C: 0,
+    hybrids: [],
+    phyrexian: [],
     unpayable: false,
   };
   const player = state.players.find((p) => p.id === playerId);
@@ -282,6 +403,8 @@ export function activateMap(
     R: 0,
     G: 0,
     C: 0,
+    hybrids: [],
+    phyrexian: [],
     unpayable: false,
   };
   if (!canPayMana(player.manaPool, payCost)) return state;
@@ -333,6 +456,8 @@ export function activateClueOrFood(
     R: 0,
     G: 0,
     C: 0,
+    hybrids: [],
+    phyrexian: [],
     unpayable: false,
   };
   if (!canPayMana(player.manaPool, payCost)) return state;
@@ -374,6 +499,11 @@ export function activateClueOrFood(
  * Activate planeswalker loyalty ability by index (0 = first listed).
  * Sorcery-speed MVP: main phase, empty stack, active player.
  */
+export function cancelLoyalty(state: GameState): GameState {
+  if (!state.pendingLoyalty) return state;
+  return { ...state, pendingLoyalty: null };
+}
+
 export function beginLoyalty(
   state: GameState,
   playerId: string,
@@ -400,6 +530,7 @@ export function beginLoyalty(
 
   // Apply loyalty cost immediately (as cost to activate)
   const nextBase = clonePlayers(state);
+  nextBase.pendingLoyalty = null;
   const pperm = nextBase.players
     .find((p) => p.id === playerId)!
     .battlefield.find((c) => c.id === permanentId)!;
@@ -465,6 +596,8 @@ export function beginEquip(
     R: 0,
     G: 0,
     C: 0,
+    hybrids: [],
+    phyrexian: [],
     unpayable: false,
   };
   if (equipCost > 0 && !canPayMana(player.manaPool, payCost)) return state;
@@ -517,6 +650,8 @@ function finalizeEquip(
     R: 0,
     G: 0,
     C: 0,
+    hybrids: [],
+    phyrexian: [],
     unpayable: false,
   };
   if (equipCost > 0) {
@@ -541,8 +676,8 @@ export function finalizeAbility(
   playerId: string,
   permanentId: string,
   targets: Record<string, TargetRef>,
-  script: NonNullable<ReturnType<typeof parseTapAbility>>,
-  opts?: { skipWardCheck?: boolean },
+  script: SpellScript,
+  opts?: { skipWardCheck?: boolean; needsTap?: boolean; manaAlreadyPaid?: boolean },
 ): GameState {
   if (!opts?.skipWardCheck && totalWardCost(state, playerId, targets) > 0) {
     return withWardGate(state, {
@@ -556,14 +691,15 @@ export function finalizeAbility(
 
   const next = clonePlayers(state);
   next.pendingCast = null;
+  next.pendingActivated = null;
   const found = findCard(next, permanentId);
   if (!found || found.zone !== 'battlefield') return { ...state, pendingCast: null };
   const perm = found.player.battlefield.find((c) => c.id === permanentId);
   if (!perm || found.player.id !== playerId) {
     return { ...state, pendingCast: null };
   }
-  // Planeswalker loyalty already paid loyalty cost — do not tap.
-  if (!isPlaneswalker(perm)) {
+  const needsTap = opts?.needsTap ?? !isPlaneswalker(perm);
+  if (needsTap) {
     if (perm.tapped) return { ...state, pendingCast: null };
     perm.tapped = true;
   }
@@ -621,6 +757,10 @@ export function continueAbilityTarget(state: GameState, target: TargetRef): Game
       sourceId,
       chosen,
       script,
+      {
+        needsTap: pending.abilityNeedsTap ?? true,
+        manaAlreadyPaid: pending.abilityManaPaid,
+      },
     );
   }
   return {

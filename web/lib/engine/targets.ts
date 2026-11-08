@@ -1,6 +1,7 @@
 import { TargetFilter, TargetRef } from './effects';
+import { hasKeywordState } from './continuous';
 import { protectsFromColors } from './protection';
-import { GameState, hasKeyword, isCreature, ManaColor } from './types';
+import { GameState, isCreature, ManaColor } from './types';
 
 function canBeTargeted(
   state: GameState,
@@ -11,8 +12,12 @@ function canBeTargeted(
   for (const p of state.players) {
     const perm = p.battlefield.find((c) => c.id === permanentId);
     if (!perm) continue;
-    if (hasKeyword(perm, 'shroud')) return false;
-    if (hasKeyword(perm, 'hexproof') && targetingPlayerId && targetingPlayerId !== perm.controller) {
+    if (hasKeywordState(perm, 'shroud', state)) return false;
+    if (
+      hasKeywordState(perm, 'hexproof', state) &&
+      targetingPlayerId &&
+      targetingPlayerId !== perm.controller
+    ) {
       return false;
     }
     if (sourceColors && sourceColors.length && protectsFromColors(perm, sourceColors)) {

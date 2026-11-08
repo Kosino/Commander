@@ -6,12 +6,15 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "oracle-coverage": "npx --yes tsx scripts/oracle-coverage.ts",
+    "smoke-flow": "npx --yes tsx scripts/smoke-flow.ts"
   },
   "dependencies": {
     "next": "16.4.5",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "redis": "^6.3.1"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",

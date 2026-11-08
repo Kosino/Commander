@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
-import { authSeat, getRoom, type SeatId } from '../../../../../lib/server/rooms';
+import { authSeat, getRoomAsync, touchSeat } from '../../../../../lib/server/rooms';
+import { isSeatId } from '../../../../../lib/onlineTypes';
 import { subscribeRooms } from '../../../../../lib/server/roomStore';
 
 export const dynamic = 'force-dynamic';
@@ -12,16 +13,17 @@ export async function GET(
 ) {
   const { id } = await ctx.params;
   const roomId = id.toUpperCase();
-  const seat = req.nextUrl.searchParams.get('seat') as SeatId | null;
+  const seat = req.nextUrl.searchParams.get('seat');
   const token = req.nextUrl.searchParams.get('token') || '';
 
-  if (seat !== 'p1' && seat !== 'p2') {
+  if (!isSeatId(seat)) {
     return new Response('seat required', { status: 400 });
   }
 
-  const room = getRoom(roomId);
+  const room = await getRoomAsync(roomId);
   if (!room) return new Response('Room not found', { status: 404 });
   if (!authSeat(room, seat, token)) return new Response('Unauthorized', { status: 401 });
+  touchSeat(room, seat);
 
   const encoder = new TextEncoder();
   let closed = false;

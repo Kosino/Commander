@@ -1,25 +1,39 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import type { StoredDeck } from '../../../lib/engine/fromDeck';
 import { isValidStoredDeck } from '../../../lib/engine/fromDeck';
-import type { GameState, RoomAction, SeatId } from '../../../lib/onlineTypes';
+import type { GameState, MaxSeats, RoomAction, SeatId } from '../../../lib/onlineTypes';
+import { ALL_SEATS } from '../../../lib/onlineTypes';
 import { loadPlayDeck } from '../../../lib/playSession';
+import { ArenaTable } from '../../../components/play/ArenaTable';
+import {
+  isCombatDeclaring,
+  legalAttackers,
+  legalBlockers,
+  listLegalTargets,
+  parseLoyaltyAbilities,
+  parseActivatedAbilities,
+  type CardInstance,
+  type TargetRef,
+} from '../../../lib/engine';
 
 type Session = {
   roomId: string;
   seat: SeatId;
   seatToken: string;
-  names: Record<SeatId, string>;
+  names: Partial<Record<SeatId, string>>;
 };
 
 type View = {
   version: number;
-  names: Record<SeatId, string>;
-  joined: Record<SeatId, boolean>;
+  maxSeats?: MaxSeats;
+  names: Partial<Record<SeatId, string>>;
+  joined: Partial<Record<SeatId, boolean>>;
+  lastSeen?: Partial<Record<SeatId, number>>;
   you: SeatId;
-  deckHint?: Record<SeatId, string>;
+  deckHint?: Partial<Record<SeatId, string>>;
   state: GameState | null;
 };
 
@@ -35,6 +49,7 @@ export default function OnlinePlayPage() {
   const [deckChoice, setDeckChoice] = useState<DeckChoice>('session');
   const [fileDeck, setFileDeck] = useState<StoredDeck | null>(null);
   const [sessionDeck, setSessionDeck] = useState<StoredDeck | null>(null);
+  const [maxSeats] = useState<MaxSeats>(2);
 
   useEffect(() => {
     setSessionDeck(loadPlayDeck());
@@ -111,7 +126,7 @@ export default function OnlinePlayPage() {
       const res = await fetch('/api/room', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'create', name, deck }),
+        body: JSON.stringify({ action: 'create', name, deck, maxSeats }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Create failed');
@@ -190,31 +205,29 @@ export default function OnlinePlayPage() {
   };
 
   const state = view?.state ?? null;
-  const you = state?.players.find((p) => p.id === session?.seat);
-  const opp = state?.players.find((p) => p.id !== session?.seat);
   const myPriority = state?.players[state.priorityPlayerIndex]?.id === session?.seat;
-
-  const canPass = useMemo(() => {
-    if (!state || !session) return false;
-    if (state.pendingCast || state.pendingChoices.length) return false;
-    if (state.combat?.mode === 'declareAttackers' || state.combat?.mode === 'declareBlockers') {
-      return false;
-    }
-    return myPriority && !state.winnerId;
-  }, [state, session, myPriority]);
 
   if (!session) {
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-100 p-6 max-w-lg mx-auto space-y-6">
         <div className="flex items-center justify-between gap-3">
-          <h1 className="text-2xl font-bold">Online 2 hráči</h1>
-          <Link href="/play" className="text-sm text-zinc-400 hover:text-zinc-200">
-            ← Solo AI
-          </Link>
+          <div>
+            <Link href="/" className="text-xs text-zinc-500 hover:text-zinc-300">
+              Tablebound
+            </Link>
+            <h1 className="text-2xl font-bold">Play against friend</h1>
+          </div>
+          <div className="flex gap-3 text-sm">
+            <Link href="/play" className="text-zinc-400 hover:text-zinc-200">
+              Modes
+            </Link>
+            <Link href="/builder" className="text-zinc-400 hover:text-zinc-200">
+              Deckbuilder
+            </Link>
+          </div>
         </div>
         <p className="text-sm text-zinc-500">
           Vytvoř místnost a pošli kód soupeři. Každý přinese vlastní deck (nebo demo).
-          Stav se ukládá do <code className="text-zinc-400">.data/rooms.json</code> a syncuje přes SSE.
         </p>
         <label className="block text-sm space-y-1">
           <span className="text-zinc-400">Jméno</span>
@@ -303,19 +316,56 @@ export default function OnlinePlayPage() {
   }
 
   if (!state) {
+    const cap = view?.maxSeats || maxSeats;
+    const seatList = ALL_SEATS.slice(0, cap);
+    const filled = seatList.filter((s) => view?.joined?.[s]).length;
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-100 p-6 max-w-lg mx-auto space-y-4">
-        <h1 className="text-xl font-bold">Čekám na soupeře…</h1>
+        <h1 className="text-xl font-bold">Lobby ({filled}/{cap})</h1>
         <p className="text-3xl font-mono tracking-widest text-indigo-300">{session.roomId}</p>
         <p className="text-sm text-zinc-500">
           Ty jsi <strong>{session.seat}</strong> (
-          {view?.names?.[session.seat] || session.names[session.seat]}). Pošli kód druhému hráči.
-          {view?.deckHint && (
-            <span className="block mt-1 text-xs">
-              Decy: p1={view.deckHint.p1} · p2={view.deckHint.p2}
-            </span>
-          )}
+          {view?.names?.[session.seat] || session.names[session.seat]}). Pošli kód ostatním.
         </p>
+        <ul className="text-sm space-y-1">
+          {seatList.map((s) => (
+            <li key={s} className="flex justify-between gap-2 border-b border-zinc-800 py-1">
+              <span>
+                {s}: {view?.names?.[s] || '—'}
+                {view?.joined?.[s] ? '' : ' (volné)'}
+              </span>
+              <span className="text-xs text-zinc-500">{view?.deckHint?.[s] || '—'}</span>
+            </li>
+          ))}
+        </ul>
+        {session.seat === 'p1' && filled >= 2 && (
+          <button
+            type="button"
+            className="w-full bg-emerald-800 hover:bg-emerald-700 rounded py-2 text-sm"
+            onClick={() =>
+              void fetch('/api/room', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  action: 'start',
+                  roomId: session.roomId,
+                  seat: session.seat,
+                  token: session.seatToken,
+                }),
+              }).then(async (res) => {
+                if (!res.ok) {
+                  const d = await res.json().catch(() => ({}));
+                  setError(d.error || 'Start failed');
+                  return;
+                }
+                void refresh(session);
+              })
+            }
+          >
+            Start game now
+          </button>
+        )}
+        {error && <p className="text-sm text-red-400">{error}</p>}
         <Link href="/play/online" className="text-sm text-zinc-400">
           Zrušit
         </Link>
@@ -324,36 +374,126 @@ export default function OnlinePlayPage() {
     );
   }
 
+  const castingMine = !!state.pendingCast && state.pendingCast.playerId === session.seat;
+  const declaring = isCombatDeclaring(state);
+
+  const legal = (() => {
+    if (!state.pendingCast || state.pendingCast.playerId !== session.seat) return [] as TargetRef[];
+    const slot = state.pendingCast.slots[state.pendingCast.currentSlot];
+    if (!slot) return [];
+    return listLegalTargets(state, slot.filter);
+  })();
+  const highlightIds = new Set<string>();
+  for (const t of legal) if (t.kind === 'permanent') highlightIds.add(t.permanentId);
+  const highlightPlayers = new Set<string>();
+  for (const t of legal) if (t.kind === 'player') highlightPlayers.add(t.playerId);
+  const highlightStackIds = new Set<string>();
+  for (const t of legal) if (t.kind === 'stack') highlightStackIds.add(t.stackId);
+  if (state.combat?.mode === 'declareAttackers') {
+    for (const id of legalAttackers(state)) highlightIds.add(id);
+    for (const id of state.combat.draftAttackerIds) highlightIds.add(id);
+  }
+  if (state.combat?.mode === 'declareBlockers') {
+    for (const id of legalBlockers(state)) highlightIds.add(id);
+    for (const ids of Object.values(state.combat.draftBlocks)) {
+      for (const id of ids) highlightIds.add(id);
+    }
+    for (const a of state.combat.attackers) highlightIds.add(a.attackerId);
+  }
+
+  const onBattlefield = (playerId: string, card: CardInstance) => {
+    if (state.combat?.mode === 'declareAttackers') {
+      void send({ type: 'toggleDraftAttacker', creatureId: card.id });
+      return;
+    }
+    if (state.combat?.mode === 'declareBlockers') {
+      if (state.combat.attackers.some((a) => a.attackerId === card.id)) {
+        void send({ type: 'focusAttacker', attackerId: card.id });
+      } else {
+        const focus = state.combat.focusAttackerId || state.combat.attackers[0]?.attackerId;
+        if (focus) void send({ type: 'toggleDraftBlocker', attackerId: focus, blockerId: card.id });
+      }
+      return;
+    }
+    if (castingMine) {
+      void send({
+        type: 'selectCastTarget',
+        target: { kind: 'permanent', permanentId: card.id },
+      });
+      return;
+    }
+    if (myPriority && playerId === session.seat) {
+      void send({ type: 'activateMana', cardId: card.id });
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 p-4 md:p-6 space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold">Online · {session.roomId}</h1>
-          <p className="text-xs text-zinc-500">
-            Ty: {session.seat} ({you?.name}) · v{view?.version}
-            {myPriority ? ' · tvá priorita' : ''}
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Link
-            href="/play"
-            className="text-sm bg-zinc-800 border border-zinc-700 px-3 py-1.5 rounded"
-          >
-            Solo AI
-          </Link>
-          <button
-            type="button"
-            disabled={!canPass}
-            onClick={() => void send({ type: 'pass' })}
-            className="text-sm bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded disabled:opacity-40"
-          >
-            Pass
-          </button>
-        </div>
+    <>
+      <div className="fixed top-2 right-2 z-30 flex flex-wrap gap-1.5 text-[0.65rem]">
+        <span className="px-2 py-1 border border-[var(--pt-line,#2a2f2c)] bg-black/50 font-mono">
+          {session.roomId}
+        </span>
+        <Link
+          href="/play"
+          className="px-2 py-1 border border-[var(--pt-line,#2a2f2c)] bg-black/50 hover:border-amber-600"
+        >
+          Modes
+        </Link>
+        <Link
+          href="/play/online"
+          className="px-2 py-1 border border-[var(--pt-line,#2a2f2c)] bg-black/50 hover:border-amber-600"
+        >
+          Lobby
+        </Link>
       </div>
-
-      {error && <p className="text-sm text-red-400">{error}</p>}
-
+      {error && (
+        <div className="fixed top-10 left-1/2 z-30 -translate-x-1/2 text-sm text-red-300 bg-black/80 px-3 py-1 border border-red-900">
+          {error}
+        </div>
+      )}
+      <ArenaTable
+        state={state}
+        youId={session.seat}
+        sourceLabel={`online · v${view?.version ?? 0}`}
+        highlightIds={highlightIds}
+        highlightPlayers={highlightPlayers}
+        highlightStackIds={highlightStackIds}
+        casting={castingMine || declaring}
+        onPass={() => void send({ type: 'pass' })}
+        onPlayerLifeClick={(pid) => {
+          if (castingMine) {
+            void send({ type: 'selectCastTarget', target: { kind: 'player', playerId: pid } });
+          }
+        }}
+        onBattlefieldCard={onBattlefield}
+        onHandCard={(c) => {
+          if (!myPriority || state.pendingCast) return;
+          if (c.card.type_line.includes('Land')) void send({ type: 'playLand', cardId: c.id });
+          else void send({ type: 'beginCast', cardId: c.id });
+        }}
+        onCommandCard={(c) => {
+          if (myPriority && !state.pendingCast) {
+            void send({ type: 'beginCastCommander', cardId: c.id });
+          }
+        }}
+        onStackObject={(stackId) => {
+          if (castingMine) {
+            void send({ type: 'selectCastTarget', target: { kind: 'stack', stackId } });
+          }
+        }}
+        onGraveyardCard={
+          castingMine
+            ? (c) =>
+                void send({
+                  type: 'selectCastTarget',
+                  target: { kind: 'permanent', permanentId: c.id },
+                })
+            : myPriority && !state.pendingCast
+              ? (c) => void send({ type: 'beginCastFlashback', cardId: c.id })
+              : undefined
+        }
+        promptSlot={
+          <>
       {state.pendingChoices.length > 0 && (
         <div className="p-3 bg-amber-950 border border-amber-800 rounded space-y-2 text-sm">
           <div className="font-semibold text-amber-200">SBA choice</div>
@@ -587,11 +727,79 @@ export default function OnlinePlayPage() {
                 </div>
               );
             }
+            if (choice.type === 'mulligan') {
+              const hand = state.players.find((p) => p.id === choice.playerId)?.hand || [];
+              return (
+                <div key={i} className="space-y-1">
+                  <div>
+                    Mulligan ({choice.mulligansTaken} · {choice.phase})
+                    {!mine && <span className="text-zinc-500"> (ceka souper)</span>}
+                  </div>
+                  {mine && choice.phase === 'decide' && (
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        className="text-xs bg-amber-800 px-2 py-1 rounded"
+                        onClick={() => void send({ type: 'resolveMulliganKeep' })}
+                      >
+                        Keep
+                      </button>
+                      <button
+                        type="button"
+                        className="text-xs bg-zinc-700 px-2 py-1 rounded"
+                        onClick={() => void send({ type: 'resolveMulliganTake' })}
+                      >
+                        Mulligan
+                      </button>
+                    </div>
+                  )}
+                  {mine && choice.phase === 'bottom' && (
+                    <button
+                      type="button"
+                      className="text-xs bg-amber-800 px-2 py-1 rounded"
+                      onClick={() =>
+                        void send({
+                          type: 'resolveMulliganBottom',
+                          bottomIds: hand.slice(0, choice.mulligansTaken).map((c) => c.id),
+                        })
+                      }
+                    >
+                      Bottom first {choice.mulligansTaken}
+                    </button>
+                  )}
+                </div>
+              );
+            }
+            if (choice.type === 'orderTriggers') {
+              return (
+                <div key={i} className="space-y-1">
+                  <div>
+                    Trigger order ({choice.triggerIds.length})
+                    {!mine && <span className="text-zinc-500"> (čeká soupeř)</span>}
+                  </div>
+                  {mine && (
+                    <button
+                      type="button"
+                      className="text-xs bg-amber-800 px-2 py-1 rounded"
+                      onClick={() =>
+                        void send({
+                          type: 'resolveTriggerOrder',
+                          orderedIds: choice.triggerIds,
+                        })
+                      }
+                    >
+                      Confirm default order
+                    </button>
+                  )}
+                </div>
+              );
+            }
+            if (choice.type !== 'commanderToCommandZone') return null;
             return (
               <div key={i} className="space-y-1">
                 <div>
                   Commander → command zone? ({choice.from})
-                  {!mine && <span className="text-zinc-500"> (čeká soupeř)</span>}
+                  {!mine && <span className="text-zinc-500"> (ceka souper)</span>}
                 </div>
                 {mine && (
                   <div className="flex gap-2">
@@ -626,51 +834,6 @@ export default function OnlinePlayPage() {
               </div>
             );
           })}
-        </div>
-      )}
-
-      <div className="text-sm bg-zinc-900 border border-zinc-800 rounded px-3 py-2 flex flex-wrap gap-3">
-        <span>
-          Tah {state.turnNumber}
-        </span>
-        <span>
-          {state.phase}/{state.step}
-        </span>
-        <span>Stack {state.stack.length}</span>
-        {state.monarchPlayerId && (
-          <span className="text-yellow-300">
-            Monarch{' '}
-            {state.players.find((p) => p.id === state.monarchPlayerId)?.name ||
-              state.monarchPlayerId}
-          </span>
-        )}
-        {state.players.some((p) => p.citysBlessing) && (
-          <span className="text-sky-300">
-            Blessing{' '}
-            {state.players
-              .filter((p) => p.citysBlessing)
-              .map((p) => p.name)
-              .join(', ')}
-          </span>
-        )}
-      </div>
-
-      {state.stack.length > 0 && (
-        <div className="bg-zinc-900 border border-dashed border-zinc-700 rounded p-2 space-y-1">
-          <div className="text-xs text-zinc-500">Stack (klik = counter target)</div>
-          {[...state.stack].reverse().map((obj) => (
-            <button
-              key={obj.id}
-              type="button"
-              disabled={state.pendingCast?.playerId !== session.seat}
-              onClick={() =>
-                void send({ type: 'selectCastTarget', target: { kind: 'stack', stackId: obj.id } })
-              }
-              className="block w-full text-left text-xs bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 px-2 py-1 rounded"
-            >
-              [{obj.kind}] {obj.name}
-            </button>
-          ))}
         </div>
       )}
 
@@ -735,6 +898,92 @@ export default function OnlinePlayPage() {
             </button>
           </div>
         )}
+
+      {state.combat?.mode === 'assignDamage' &&
+        state.players[state.activePlayerIndex]?.id === session.seat && (
+          <div className="p-3 bg-red-950 border border-red-800 rounded text-sm space-y-2">
+            <div className="font-semibold text-red-200">Assign combat damage</div>
+            <p className="text-xs text-red-100/70">
+              Prefill = lethal; Confirm applies (edit via setDamage API later / use solo for fine control).
+            </p>
+            <button
+              type="button"
+              className="bg-red-700 px-3 py-1 rounded text-xs"
+              onClick={() => void send({ type: 'confirmDamageAssign' })}
+            >
+              Confirm damage
+            </button>
+          </div>
+        )}
+
+      {state.pendingLoyalty && state.pendingLoyalty.playerId === session.seat && (
+        <div className="p-3 bg-sky-950 border border-sky-800 rounded text-sm space-y-2">
+          <div className="flex justify-between">
+            <span className="font-semibold text-sky-200">Loyalty</span>
+            <button
+              type="button"
+              className="text-xs bg-zinc-800 px-2 py-1 rounded"
+              onClick={() => void send({ type: 'cancelLoyalty' })}
+            >
+              Cancel
+            </button>
+          </div>
+          {(() => {
+            const pid = state.pendingLoyalty!.permanentId;
+            const perm = state.players.flatMap((p) => p.battlefield).find((c) => c.id === pid);
+            return parseLoyaltyAbilities(perm?.card.oracle_text).map((ab, i) => (
+              <button
+                key={i}
+                type="button"
+                className="text-xs bg-sky-800 px-2 py-1 rounded mr-1"
+                title={ab.text}
+                onClick={() =>
+                  void send({ type: 'beginLoyalty', permanentId: pid, abilityIndex: i })
+                }
+              >
+                {ab.loyaltyCost >= 0 ? '+' : ''}
+                {ab.loyaltyCost}
+              </button>
+            ));
+          })()}
+        </div>
+      )}
+
+      {state.pendingActivated && state.pendingActivated.playerId === session.seat && (
+        <div className="p-3 bg-emerald-950 border border-emerald-800 rounded text-sm space-y-2">
+          <div className="flex justify-between">
+            <span className="font-semibold text-emerald-200">Activated ability</span>
+            <button
+              type="button"
+              className="text-xs bg-zinc-800 px-2 py-1 rounded"
+              onClick={() => void send({ type: 'cancelActivated' })}
+            >
+              Cancel
+            </button>
+          </div>
+          {(() => {
+            const pid = state.pendingActivated!.permanentId;
+            const perm = state.players.flatMap((p) => p.battlefield).find((c) => c.id === pid);
+            const abs = parseActivatedAbilities(perm?.card.oracle_text);
+            return state.pendingActivated!.options.map((idx) => (
+              <button
+                key={idx}
+                type="button"
+                className="text-xs bg-emerald-800 px-2 py-1 rounded mr-1"
+                onClick={() =>
+                  void send({
+                    type: 'beginActivatedIndex',
+                    permanentId: pid,
+                    abilityIndex: idx,
+                  })
+                }
+              >
+                {abs[idx]?.costLabel || `#${idx}`}
+              </button>
+            ));
+          })()}
+        </div>
+      )}
 
       {state.pendingCast && state.pendingCast.playerId === session.seat && (
         <div className="p-3 bg-fuchsia-950 border border-fuchsia-700 rounded text-sm space-y-2">
@@ -831,216 +1080,9 @@ export default function OnlinePlayPage() {
           )}
         </div>
       )}
-
-      <div className="space-y-3">
-        {opp && (
-          <OnlinePanel
-            title={`${opp.name} (soupeř)`}
-            player={opp}
-            hideHand
-            onLifeClick={
-              state.pendingCast?.playerId === session.seat
-                ? () => void send({ type: 'selectCastTarget', target: { kind: 'player', playerId: opp.id } })
-                : undefined
-            }
-            onPermanentClick={
-              state.pendingCast?.playerId === session.seat
-                ? (id) =>
-                    void send({
-                      type: 'selectCastTarget',
-                      target: { kind: 'permanent', permanentId: id },
-                    })
-                : undefined
-            }
-          />
-        )}
-        {you && (
-          <OnlinePanel
-            title={`${you.name} (ty)`}
-            player={you}
-            onHandClick={
-              myPriority && !state.pendingCast
-                ? (card) => {
-                    if (card.card.type_line.includes('Land')) {
-                      void send({ type: 'playLand', cardId: card.id });
-                    } else {
-                      void send({ type: 'beginCast', cardId: card.id });
-                    }
-                  }
-                : undefined
-            }
-            onCommandClick={
-              myPriority && !state.pendingCast
-                ? (card) => void send({ type: 'beginCastCommander', cardId: card.id })
-                : undefined
-            }
-            onGraveyardClick={
-              state.pendingCast?.playerId === session.seat
-                ? (card) =>
-                    void send({
-                      type: 'selectCastTarget',
-                      target: { kind: 'permanent', permanentId: card.id },
-                    })
-                : myPriority && !state.pendingCast
-                  ? (card) => void send({ type: 'beginCastFlashback', cardId: card.id })
-                  : undefined
-            }
-            onPermanentClick={(id) => {
-              if (state.combat?.mode === 'declareAttackers') {
-                void send({ type: 'toggleDraftAttacker', creatureId: id });
-                return;
-              }
-              if (state.combat?.mode === 'declareBlockers') {
-                if (state.combat.attackers.some((a) => a.attackerId === id)) {
-                  void send({ type: 'focusAttacker', attackerId: id });
-                } else {
-                  const focus =
-                    state.combat.focusAttackerId || state.combat.attackers[0]?.attackerId;
-                  if (focus) {
-                    void send({ type: 'toggleDraftBlocker', attackerId: focus, blockerId: id });
-                  }
-                }
-                return;
-              }
-              if (state.pendingCast?.playerId === session.seat) {
-                void send({
-                  type: 'selectCastTarget',
-                  target: { kind: 'permanent', permanentId: id },
-                });
-                return;
-              }
-              if (myPriority) void send({ type: 'activateMana', cardId: id });
-            }}
-            onLifeClick={
-              state.pendingCast?.playerId === session.seat
-                ? () =>
-                    void send({
-                      type: 'selectCastTarget',
-                      target: { kind: 'player', playerId: you.id },
-                    })
-                : undefined
-            }
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function OnlinePanel({
-  title,
-  player,
-  hideHand,
-  onHandClick,
-  onCommandClick,
-  onPermanentClick,
-  onGraveyardClick,
-  onLifeClick,
-}: {
-  title: string;
-  player: GameState['players'][number];
-  hideHand?: boolean;
-  onHandClick?: (card: GameState['players'][number]['hand'][number]) => void;
-  onCommandClick?: (card: GameState['players'][number]['commandZone'][number]) => void;
-  onPermanentClick?: (id: string) => void;
-  onGraveyardClick?: (card: GameState['players'][number]['graveyard'][number]) => void;
-  onLifeClick?: () => void;
-}) {
-  return (
-    <div className="border border-zinc-800 rounded-lg p-3 bg-zinc-950 space-y-2">
-      <div className="flex justify-between text-sm">
-        <span className="font-semibold">{title}</span>
-        {onLifeClick ? (
-          <button type="button" onClick={onLifeClick} className="tabular-nums underline-offset-2 hover:underline">
-            Life {player.life}
-          </button>
-        ) : (
-          <span className="tabular-nums text-zinc-400">Life {player.life}</span>
-        )}
-      </div>
-      <div className="text-xs text-zinc-500">
-        Hand {player.hand.length} · BF {player.battlefield.length} · Lib {player.library.length} ·
-        Lands {player.landsPlayedThisTurn}/1
-        {Object.keys(player.commanderDamage).length > 0 && (
-          <span className="text-amber-500">
-            {' '}
-            · Cmd{' '}
-            {Object.entries(player.commanderDamage)
-              .map(([id, d]) => `${d}`)
-              .join('/')}
-          </span>
-        )}
-        {player.citysBlessing && <span className="text-sky-300"> · blessing</span>}
-      </div>
-      {player.commandZone.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          {player.commandZone.map((c) => (
-            <button
-              key={c.id}
-              type="button"
-              disabled={!onCommandClick}
-              onClick={() => onCommandClick?.(c)}
-              className="text-xs border border-amber-800 text-amber-200 rounded px-1.5 py-0.5 disabled:opacity-50"
-              title={`Cast from command (tax ×${c.commanderCastCount})`}
-            >
-              CZ: {c.card.name} {c.card.mana_cost || ''}
-              {c.commanderCastCount > 0 ? ` +${2 * c.commanderCastCount}` : ''}
-            </button>
-          ))}
-        </div>
-      )}
-      {!hideHand && (
-        <div className="flex flex-wrap gap-1">
-          {player.hand.map((c) => (
-            <button
-              key={c.id}
-              type="button"
-              disabled={!onHandClick}
-              onClick={() => onHandClick?.(c)}
-              className="text-xs border border-zinc-700 rounded px-1.5 py-0.5 disabled:opacity-50"
-            >
-              {c.card.name} {c.card.mana_cost || ''}
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="flex flex-wrap gap-1">
-        {player.battlefield.map((c) => (
-          <button
-            key={c.id}
-            type="button"
-            disabled={!onPermanentClick}
-            onClick={() => onPermanentClick?.(c.id)}
-            className={`text-xs border rounded px-1.5 py-0.5 ${
-              c.tapped ? 'border-zinc-600 italic text-zinc-500' : 'border-zinc-700'
-            }`}
-          >
-            {c.isToken ? '[T] ' : ''}
-            {c.card.name}
-            {c.goaded ? ' (goad)' : ''}
-            {c.unearthed ? ' (unearth)' : ''}
-            {(c.counters['+1/+1'] || 0) > 0 ? ` +${c.counters['+1/+1']}` : ''}
-            {(c.counters['loyalty'] || 0) > 0 ? ` ♥${c.counters['loyalty']}` : ''}
-            {c.damageMarked ? ` (−${c.damageMarked})` : ''}
-          </button>
-        ))}
-      </div>
-      {player.graveyard.length > 0 && (
-        <div className="flex flex-wrap gap-1">
-          <span className="text-[10px] uppercase text-zinc-600 self-center">GY</span>
-          {player.graveyard.map((c) => (
-            <button
-              key={c.id}
-              type="button"
-              disabled={!onGraveyardClick}
-              onClick={() => onGraveyardClick?.(c)}
-              className="text-xs border border-zinc-800 text-zinc-400 rounded px-1.5 py-0.5 disabled:opacity-50"
-            >
-              {c.card.name}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
+          </>
+        }
+      />
+    </>
   );
 }
