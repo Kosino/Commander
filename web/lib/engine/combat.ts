@@ -8,8 +8,10 @@ import {
   emptyCombat,
   GameState,
   hasKeyword,
+  isBattle,
   isCreature,
   isPlaneswalker,
+  isSiege,
   canAttack,
   effectivePower,
   effectiveToughness,
@@ -98,6 +100,7 @@ export function setDefendPlayer(state: GameState, defendingPlayerId: string): Ga
       ...state.combat,
       draftDefendPlayerId: defendingPlayerId,
       draftDefendPlaneswalkerId: null,
+      draftDefendBattleId: null,
     },
   };
 }
@@ -117,8 +120,62 @@ export function setDefendPlaneswalker(
   }
   return {
     ...state,
-    combat: { ...state.combat, draftDefendPlaneswalkerId: planeswalkerId },
+    combat: {
+      ...state.combat,
+      draftDefendPlaneswalkerId: planeswalkerId,
+      draftDefendBattleId: null,
+    },
   };
+}
+
+/**
+ * Attack a battle (CR 508 / 310). Siege: controller attacks; protector is defending player.
+ */
+export function setDefendBattle(state: GameState, battleId: string | null): GameState {
+  if (state.combat?.mode !== 'declareAttackers') return state;
+  const active = ap(state);
+  if (!active) return state;
+  if (!battleId) {
+    return {
+      ...state,
+      combat: { ...state.combat, draftDefendBattleId: null },
+    };
+  }
+  const found = findCard(state, battleId);
+  if (!found || found.zone !== 'battlefield') return state;
+  const battle = found.player.battlefield.find((c) => c.id === battleId);
+  if (!battle || !isBattle(battle)) return state;
+  const protector = battle.protectorPlayerId;
+  if (!protector) return state;
+  if (isSiege(battle) && battle.controller !== active.id) return state;
+  if (!isSiege(battle) && battle.controller === active.id) return state;
+  return {
+    ...state,
+    combat: {
+      ...state.combat,
+      draftDefendBattleId: battleId,
+      draftDefendPlayerId: protector,
+      draftDefendPlaneswalkerId: null,
+    },
+  };
+}
+
+/** Battles the active player may attack this combat. */
+export function legalBattleTargets(state: GameState): string[] {
+  const active = ap(state);
+  if (!active) return [];
+  const out: string[] = [];
+  for (const p of state.players) {
+    for (const perm of p.battlefield) {
+      if (!isBattle(perm)) continue;
+      if ((perm.counters['defense'] ?? 0) <= 0) continue;
+      if (!perm.protectorPlayerId) continue;
+      if (isSiege(perm) || true) {
+        if (perm.controller === active.id) out.push(perm.id);
+      }
+    }
+  }
+  return out;
 }
 
 export function toggleDraftAttacker(state: GameState, creatureId: string): GameState {
@@ -132,12 +189,73 @@ export function toggleDraftAttacker(state: GameState, creatureId: string): GameS
   if (!legalAttackers(state).includes(creatureId)) return state;
 
   const ids = new Set(state.combat.draftAttackerIds);
-  if (ids.has(creatureId)) ids.delete(creatureId);
-  else ids.add(creatureId);
+  const targets = { ...(state.combat.draftAttackTargets || {}) };
+  if (ids.has(creatureId)) {
+    ids.delete(creatureId);
+    delete targets[creatureId];
+  } else {
+    ids.add(creatureId);
+    const defendId = state.combat.draftDefendPlayerId;
+    if (defendId) {
+      targets[creatureId] = {
+        defendingPlayerId: defendId,
+        defendingPlaneswalkerId: state.combat.draftDefendPlaneswalkerId,
+        defendingBattleId: state.combat.draftDefendBattleId,
+      };
+    }
+  }
 
   return {
     ...state,
-    combat: { ...state.combat, draftAttackerIds: [...ids] },
+    combat: {
+      ...state.combat,
+      draftAttackerIds: [...ids],
+      draftAttackTargets: targets,
+      focusAttackerId: creatureId,
+    },
+  };
+}
+
+/** Arena: assign this attacker to face / PW / battle (per-creature). */
+export function setAttackerDefendTarget(
+  state: GameState,
+  attackerId: string,
+  target: {
+    defendingPlayerId: string;
+    defendingPlaneswalkerId?: string | null;
+    defendingBattleId?: string | null;
+  },
+): GameState {
+  if (state.combat?.mode !== 'declareAttackers') return state;
+  const active = ap(state);
+  if (!active || state.combat.declaringPlayerId !== active.id) return state;
+  if (!state.combat.draftAttackerIds.includes(attackerId)) {
+    // Auto-add to draft when assigning a target via drag
+    const found = findCard(state, attackerId);
+    if (!found || found.zone !== 'battlefield' || found.player.id !== active.id) return state;
+    if (!legalAttackers(state).includes(attackerId)) return state;
+  }
+  const ids = state.combat.draftAttackerIds.includes(attackerId)
+    ? state.combat.draftAttackerIds
+    : [...state.combat.draftAttackerIds, attackerId];
+  return {
+    ...state,
+    combat: {
+      ...state.combat,
+      draftAttackerIds: ids,
+      draftAttackTargets: {
+        ...(state.combat.draftAttackTargets || {}),
+        [attackerId]: {
+          defendingPlayerId: target.defendingPlayerId,
+          defendingPlaneswalkerId: target.defendingPlaneswalkerId ?? null,
+          defendingBattleId: target.defendingBattleId ?? null,
+        },
+      },
+      focusAttackerId: attackerId,
+      draftDefendPlayerId: target.defendingPlayerId,
+      draftDefendPlaneswalkerId: target.defendingPlaneswalkerId ?? null,
+      draftDefendBattleId: target.defendingBattleId ?? null,
+    },
   };
 }
 
@@ -164,10 +282,27 @@ export function confirmAttackers(state: GameState): GameState {
       continue;
     }
     if (!hasKeywordState(perm, 'vigilance', next)) perm.tapped = true;
+    const per = state.combat.draftAttackTargets?.[id];
+    const battleId =
+      per?.defendingBattleId ?? state.combat.draftDefendBattleId ?? null;
+    let defendPlayer = per?.defendingPlayerId || defendId;
+    let pwId = per
+      ? per.defendingPlaneswalkerId ?? null
+      : state.combat.draftDefendPlaneswalkerId || null;
+    if (battleId) {
+      const bf = findCard(next, battleId);
+      const battle =
+        bf?.zone === 'battlefield'
+          ? bf.player.battlefield.find((c) => c.id === battleId)
+          : undefined;
+      if (battle?.protectorPlayerId) defendPlayer = battle.protectorPlayerId;
+      pwId = null;
+    }
     attackers.push({
       attackerId: id,
-      defendingPlayerId: defendId,
-      defendingPlaneswalkerId: state.combat.draftDefendPlaneswalkerId || null,
+      defendingPlayerId: defendPlayer,
+      defendingPlaneswalkerId: battleId ? null : pwId,
+      defendingBattleId: battleId,
       blockers: [],
     });
   }
@@ -242,7 +377,7 @@ export function confirmAttackers(state: GameState): GameState {
     }
   }
 
-  // Annihilator — defending player sacrifices N permanents (pending)
+  // Annihilator — triggered (702.85), then defending player sacs N
   for (const a of attackers) {
     const af = findCard(next, a.attackerId);
     const atk =
@@ -252,10 +387,17 @@ export function confirmAttackers(state: GameState): GameState {
     if (!atk) continue;
     const n = getAnnihilator(atk.card);
     if (n > 0) {
-      next.pendingChoices = [
-        ...next.pendingChoices,
-        { type: 'sacrificePermanents', playerId: a.defendingPlayerId, amount: n },
-      ];
+      next = queueTrigger(next, {
+        controllerId: atk.controller,
+        name: `${atk.card.name} annihilator`,
+        sourcePermanentId: atk.id,
+        script: {
+          targets: [],
+          effects: [
+            { type: 'forceSacrifice', playerId: a.defendingPlayerId, amount: n },
+          ],
+        },
+      });
     }
   }
 
@@ -427,6 +569,45 @@ export function moveDraftBlocker(
   };
 }
 
+/**
+ * Arena drag: drop blocker onto attacker — add, or if already blocking that
+ * attacker move to end of damage-assignment order (never removes on drop).
+ */
+export function dropBlockerOnAttacker(
+  state: GameState,
+  attackerId: string,
+  blockerId: string,
+): GameState {
+  if (state.combat?.mode !== 'declareBlockers') return state;
+  const defId = state.combat.declaringPlayerId;
+  if (!defId) return state;
+
+  const blockerFound = findCard(state, blockerId);
+  if (!blockerFound || blockerFound.zone !== 'battlefield' || blockerFound.player.id !== defId) {
+    return state;
+  }
+  if (!isCreature(blockerFound.card) || blockerFound.card.tapped) return state;
+
+  const attackerFound = findCard(state, attackerId);
+  if (!attackerFound || attackerFound.zone !== 'battlefield') return state;
+
+  const onThis = (state.combat.draftBlocks[attackerId] || []).includes(blockerId);
+  if (!onThis && !canBlock(attackerFound.card, blockerFound.card, state)) return state; // CardInstance
+
+  const draft = { ...state.combat.draftBlocks };
+  for (const [aid, list] of Object.entries(draft)) {
+    draft[aid] = list.filter((id) => id !== blockerId);
+  }
+  const list = [...(draft[attackerId] || [])];
+  list.push(blockerId);
+  draft[attackerId] = list;
+
+  return {
+    ...state,
+    combat: { ...state.combat, draftBlocks: draft, focusAttackerId: attackerId },
+  };
+}
+
 export function confirmBlockers(state: GameState): GameState {
   if (state.combat?.mode !== 'declareBlockers') return state;
   const next = clonePlayers(state);
@@ -525,6 +706,8 @@ function applyRedirectedCombatDamage(
   if (protectsFromColors(dest, attacker.card.colors || [])) return;
   if (isPlaneswalker(dest)) {
     dest.counters['loyalty'] = Math.max(0, (dest.counters['loyalty'] ?? 0) - amount);
+  } else if (isBattle(dest)) {
+    dest.counters['defense'] = Math.max(0, (dest.counters['defense'] ?? 0) - amount);
   } else if (isCreature(dest)) {
     if (hasKeyword(attacker, 'infect') || hasKeyword(attacker, 'wither')) {
       dest.counters['-1/-1'] = (dest.counters['-1/-1'] || 0) + amount;
@@ -555,14 +738,39 @@ function dealCombatToPlaneswalker(
   applyRedirectedCombatDamage(next, attacker, prev.target, amount);
 }
 
+function dealCombatToBattle(
+  next: GameState,
+  attacker: CardInstance,
+  battleId: string,
+  amount: number,
+) {
+  if (amount <= 0) return;
+  const prev = applyDamageWithPrevention(
+    next,
+    { kind: 'permanent', permanentId: battleId },
+    amount,
+    { sourceControllerId: attacker.controller },
+  );
+  syncDamageReplacements(next, prev.state);
+  amount = prev.dealt;
+  if (amount <= 0) return;
+  if (prev.target.kind === 'stack') return;
+  applyRedirectedCombatDamage(next, attacker, prev.target, amount);
+}
+
 function dealCombatToPlayer(
   next: GameState,
   attacker: CardInstance,
   playerId: string,
   amount: number,
   planeswalkerId?: string | null,
+  battleId?: string | null,
 ) {
   if (amount <= 0) return;
+  if (battleId) {
+    dealCombatToBattle(next, attacker, battleId, amount);
+    return;
+  }
   if (planeswalkerId) {
     dealCombatToPlaneswalker(next, attacker, planeswalkerId, amount);
     return;
@@ -706,6 +914,11 @@ export function defaultDamageAssign(
   return entry;
 }
 
+/**
+ * Arena: pause only when the player has a real assignment choice
+ * (multi-block, or trample with excess over a single blocker).
+ * Unblocked / single-blocker lethal-only auto-assigns.
+ */
 function needsManualDamageAssign(state: GameState, wave: Wave): boolean {
   const combat = state.combat;
   if (!combat) return false;
@@ -719,8 +932,28 @@ function needsManualDamageAssign(state: GameState, wave: Wave): boolean {
     if (!attacker || !shouldAssignThisWave(attacker, wave, assigned)) continue;
     const power = effectivePower(attacker, state);
     if (power <= 0) continue;
-    if (atk.blockers.length > 1) return true;
-    if (hasKeyword(attacker, 'trample') && atk.blockers.length >= 1) return true;
+
+    const living: CardInstance[] = [];
+    for (const id of atk.blockers) {
+      const bf = findCard(state, id);
+      const blocker =
+        bf?.zone === 'battlefield'
+          ? bf.player.battlefield.find((c) => c.id === id)
+          : undefined;
+      if (!blocker) continue;
+      const tough = effectiveToughness(blocker, state);
+      if (tough != null && (blocker.damageMarked || 0) < tough) {
+        living.push(blocker);
+      }
+    }
+
+    if (living.length >= 2) return true;
+    const sole = living[0];
+    if (sole && hasKeyword(attacker, 'trample')) {
+      const tough = effectiveToughness(sole, state) ?? 0;
+      const need = Math.max(0, tough - (sole.damageMarked || 0));
+      if (power > need) return true;
+    }
   }
   return false;
 }
@@ -756,6 +989,7 @@ function assignAttackerDamage(
       atk.defendingPlayerId,
       plan.toPlayer,
       atk.defendingPlaneswalkerId,
+      atk.defendingBattleId,
     );
     dealt += plan.toPlayer;
   }

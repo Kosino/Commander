@@ -15,6 +15,8 @@ function card(
     power: opts.power,
     toughness: opts.toughness,
     loyalty: opts.loyalty,
+    defense: opts.defense,
+    other_face: opts.other_face,
     colors: (opts.colors || []) as ManaColor[],
     color_identity: (opts.color_identity || opts.colors || []) as ManaColor[],
     keywords: opts.keywords || [],
@@ -909,6 +911,44 @@ const spellsA = [
     colors: ['U'],
     color_identity: ['U', 'R'],
   }),
+  card('Class Demo', 'Enchantment — Class', {
+    mana_cost: '{1}{G}',
+    oracle_text:
+      '(Gain the next level as a sorcery to add its ability.)\nWhen Class Demo enters the battlefield, create a 1/1 green Saproling creature token.\n{1}{G}: Level 2\nCreatures you control get +1/+0.\n{2}{G}: Level 3\nCreatures you control get +1/+1 and have trample.',
+    colors: ['G'],
+    color_identity: ['U', 'R', 'G'],
+  }),
+  card('Case Demo', 'Enchantment — Case', {
+    mana_cost: '{1}{U}',
+    oracle_text:
+      'When Case Demo enters the battlefield, draw a card.\nTo solve — You control three or more creatures.\nSolved — {2}{U}: Draw a card.',
+    colors: ['U'],
+    color_identity: ['U', 'R'],
+  }),
+  card('Daybound Demo', 'Creature — Human Werewolf', {
+    mana_cost: '{2}{R}',
+    power: '2',
+    toughness: '2',
+    oracle_text: 'Daybound\nWhen Daybound Demo enters the battlefield, it deals 1 damage to any target.',
+    colors: ['R'],
+    color_identity: ['U', 'R'],
+    keywords: ['daybound'],
+    other_face: card('Nightbound Demo', 'Creature — Werewolf', {
+      mana_cost: '',
+      power: '3',
+      toughness: '3',
+      oracle_text: 'Nightbound\nMenace',
+      colors: ['R'],
+      color_identity: ['U', 'R'],
+      keywords: ['nightbound', 'menace'],
+    }),
+  }),
+  card('Become Night Demo', 'Sorcery', {
+    mana_cost: '{1}{B}',
+    oracle_text: 'It becomes night.\nDraw a card.',
+    colors: ['B'],
+    color_identity: ['U', 'R', 'B'],
+  }),
   card('Fabricate Demo', 'Creature — Construct', {
     mana_cost: '{2}{U}',
     power: '1',
@@ -970,6 +1010,39 @@ const spellsA = [
     colors: ['U'],
     color_identity: ['U', 'R'],
     keywords: ['backup 1'],
+  }),
+  card('Siege Demo', 'Battle — Siege', {
+    mana_cost: '{2}{R}',
+    defense: '3',
+    oracle_text: '(Siege — attack this battle. When defense reaches 0, exile and cast the back face.)',
+    colors: ['R'],
+    color_identity: ['U', 'R'],
+    other_face: card('Siege Demo Liberated', 'Creature — Dragon', {
+      mana_cost: '{2}{R}',
+      power: '4',
+      toughness: '4',
+      oracle_text: 'Flying, haste',
+      colors: ['R'],
+      color_identity: ['U', 'R'],
+      keywords: ['flying', 'haste'],
+    }),
+  }),
+  card('Transform Demo', 'Creature — Human', {
+    mana_cost: '{1}{U}',
+    power: '2',
+    toughness: '2',
+    oracle_text: 'When Transform Demo enters the battlefield, transform it.',
+    colors: ['U'],
+    color_identity: ['U', 'R'],
+    other_face: card('Transform Demo Night', 'Creature — Horror', {
+      mana_cost: '{1}{U}',
+      power: '4',
+      toughness: '3',
+      oracle_text: 'Menace',
+      colors: ['U'],
+      color_identity: ['U', 'R'],
+      keywords: ['menace'],
+    }),
   }),
 ];
 
@@ -1200,7 +1273,7 @@ export function getDemoOpponentDeck(): {
 } {
   return {
     playerId: 'p2',
-    playerName: 'Opponent (demo)',
+    playerName: 'AI Opponent',
     commander: commanderB,
     cards: [commanderB, ...padDeck(commanderB, [...landsB, ...spellsB])],
   };

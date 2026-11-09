@@ -114,6 +114,16 @@ export function createInitialGameState(
     };
   });
 
+  const playerClocks: GameState['playerClocks'] = {};
+  for (const p of players) {
+    playerClocks[p.id] = {
+      stops: [],
+      fullControl: false,
+      holdPriorityOnce: false,
+      passTurnMode: 'off',
+    };
+  }
+
   const base = {
     players,
     activePlayerIndex: 0,
@@ -125,6 +135,7 @@ export function createInitialGameState(
     turnNumber: 1,
     stateBasedActionsPending: false,
     pendingChoices: [] as GameState['pendingChoices'],
+    playerClocks,
     winnerId: null,
     pendingCast: null,
     pendingLoyalty: null,
@@ -134,6 +145,8 @@ export function createInitialGameState(
     monarchPlayerId: null,
     creatureDiedThisTurn: false,
     spellsCastThisTurn: 0,
+    spellsCastPreviousTurn: 0,
+    dayNight: null as 'day' | 'night' | null,
     preventionShields: [],
     redirectShields: [],
     preventCombatDamageThisTurn: false,

@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "oracle-coverage": "npx --yes tsx scripts/oracle-coverage.ts",
+    "oracle-coverage": "npx --yes tsx scripts/oracle-coverage.ts --staples",
+    "rules-tests": "npx --yes tsx --test lib/engine/__tests__/rules-regression.test.ts lib/engine/__tests__/oracle-wave1.test.ts",
     "smoke-flow": "npx --yes tsx scripts/smoke-flow.ts"
   },
   "dependencies": {

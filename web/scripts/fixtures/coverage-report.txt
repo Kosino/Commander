@@ -1,0 +1,31 @@
+label: Commander staples
+cards: 204
+strict: 73.5% (150/204)
+lenient: 76% (155/204)
+
+top 25 missing templates (strict):
+- [4] Counter target noncreature spell. | e.g. Negate
+- [4] Equip {M} | e.g. Lightning Greaves
+- [3] If an effect would create one or more tokens under your control, it creates twice that many of those tokens instead. | e.g. Doubling Season
+- [3] If you control a commander, you may cast this spell without paying its mana cost. | e.g. Fierce Guardianship
+- [2] Search your library for up to two basic land cards, reveal those cards, put one onto the battlefield tapped and the other into your hand, then shuffle. | e.g. Cultivate
+- [2] This spell can't be countered. | e.g. Dovin's Veto
+- [1] (It can't be the target of spells or abilities your opponents control. | e.g. Swiftfoot Boots
+- [1] (While they're phased out, they're treated as though they don't exist. | e.g. Teferi's Protection
+- [1] {M}, {M}: Exile any number of cards from your hand face down. | e.g. Scroll Rack
+- [1] {M}, Sacrifice this artifact: Add three mana of any one color. | e.g. Jeweled Lotus
+- [1] {M}, Sacrifice this creature: Search your library for up to two basic land cards, put them onto the battlefield tapped, then shuffle. | e.g. Burnished Hart
+- [1] {M}: Permanents your opponents control lose hexproof and indestructible until end of turn. | e.g. Shadowspear
+- [1] {M}{M}, {M}: Creatures your opponents control attack this turn if able. | e.g. Bident of Thassa
+- [1] {M}{M}{M}: Look at the top five cards of your library. | e.g. Kinnan, Bonder Prodigy
+- [1] {M}{M}{M}{M}{M}: Search your library for a legendary permanent card with mana value less than Sisay's power, put that card onto the battlefield, then shuffle. | e.g. Sisay, Weatherlight Captain
+- [1] All creatures get -X/-X until end of turn. | e.g. Toxic Deluge
+- [1] All permanents you control phase out. | e.g. Teferi's Protection
+- [1] An opponent separates those cards into two piles. | e.g. Fact or Fiction
+- [1] As an additional cost to cast this spell, pay X life. | e.g. Toxic Deluge
+- [1] As this enchantment enters, choose a creature type. | e.g. Kindred Discovery
+- [1] At the beginning of each of your postcombat main phases, you may pay X life, where X is the number of opponents that were dealt combat damage this turn. | e.g. Tymna the Weaver
+- [1] At the beginning of your draw step, you may draw two additional cards. | e.g. Sylvan Library
+- [1] At the beginning of your upkeep, reveal the top card of your library and put that card into your hand. | e.g. Dark Confidant
+- [1] Blasphemous Act deals N damage to each creature. | e.g. Blasphemous Act
+- [1] Converge — You draw X cards and lose X life, where X is the number of colors of mana spent to cast this spell. | e.g. Painful Truths

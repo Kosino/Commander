@@ -8,6 +8,8 @@ import {
 } from './combat';
 import { emptyManaPool, GameState, Phase, Step } from './types';
 import { applyDrawAmount } from './replacement';
+import { checkCasesToSolve } from './classCase';
+import { checkDayNightAtUntap } from './dayNight';
 import { advanceSagasForActivePlayer } from './saga';
 import { fireBeginningStepTriggers, flushDelayedTriggers } from './triggers';
 import { clonePlayers, moveCard } from './zones';
@@ -124,6 +126,8 @@ export function beginNextTurn(state: GameState): GameState {
   const ap = next.players[next.activePlayerIndex];
   next.creatureDiedThisTurn = false;
   next.creaturesDiedThisTurn = 0;
+  // 732.2 — snapshot before reset (previous turn's AP cast count)
+  next.spellsCastPreviousTurn = next.spellsCastThisTurn;
   next.spellsCastThisTurn = 0;
   next.preventCombatDamageThisTurn = false;
   next.preventAllDamageThisTurn = false;
@@ -132,6 +136,7 @@ export function beginNextTurn(state: GameState): GameState {
     p.landsPlayedThisTurn = 0;
     p.attackedThisTurn = false;
     p.lostLifeThisTurn = false;
+    p.gainedLifeThisTurn = false;
     // Clear goad from creatures goaded by the player whose turn is starting (701.38c)
     if (ap) {
       for (const perm of p.battlefield) {
@@ -145,6 +150,28 @@ export function beginNextTurn(state: GameState): GameState {
   next.phase = 'beginning';
   next.step = 'untap';
   next = untapActivePlayer(next);
+  next = checkDayNightAtUntap(next);
+  next.phase = 'beginning';
+  next.step = 'upkeep';
+  next = flushDelayedTriggers(next, 'upkeep');
+  next = fireBeginningStepTriggers(next, 'upkeep');
+  next = checkStateBasedActions(next);
+  next.priorityPlayerIndex = next.activePlayerIndex;
+  return next;
+}
+
+/**
+ * After London mulligans finish on turn 1: leave opening untap (no priority) and
+ * enter upkeep — same entry as beginNextTurn after untap. Arena then auto-yields
+ * through empty upkeep/draw into main1 where lands/spells can be played.
+ */
+export function beginFirstTurnAfterMulligans(state: GameState): GameState {
+  if (state.pendingChoices.some((c) => c.type === 'mulligan')) return state;
+  if (state.turnNumber !== 1 || state.phase !== 'beginning' || state.step !== 'untap') {
+    return state;
+  }
+  let next = emptyAllManaPools(state);
+  next.consecutivePasses = 0;
   next.phase = 'beginning';
   next.step = 'upkeep';
   next = flushDelayedTriggers(next, 'upkeep');
@@ -193,6 +220,7 @@ export function advanceStep(state: GameState): GameState {
 
   if (next.phase === 'beginning' && next.step === 'untap') {
     next = untapActivePlayer(next);
+    next = checkDayNightAtUntap(next);
     next.phase = 'beginning';
     next.step = 'upkeep';
   }
@@ -236,6 +264,7 @@ export function advanceStep(state: GameState): GameState {
   if (next.phase === 'ending' && next.step === 'endStep') {
     next = flushDelayedTriggers(next, 'endStep');
     next = fireBeginningStepTriggers(next, 'endStep');
+    next = checkCasesToSolve(next);
     const n = clonePlayers(next);
     if (n.monarchPlayerId) {
       const mid = n.monarchPlayerId;

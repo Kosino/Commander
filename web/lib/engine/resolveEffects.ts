@@ -110,6 +110,9 @@ function applyDamage(
   if (perm.card.type_line.includes('Planeswalker')) {
     const loy = (perm.counters['loyalty'] ?? 0) - dealt;
     perm.counters['loyalty'] = Math.max(0, loy);
+  } else if (perm.card.type_line.includes('Battle')) {
+    const def = (perm.counters['defense'] ?? 0) - dealt;
+    perm.counters['defense'] = Math.max(0, def);
   } else {
     perm.damageMarked += dealt;
   }
@@ -206,7 +209,11 @@ export function applyEffects(
       case 'gainLife': {
         const n = clonePlayers(next);
         const p = n.players.find((x) => x.id === controllerId);
-        if (p) p.life += applyLifeGain(next, controllerId, effect.amount);
+        if (p) {
+          const gained = applyLifeGain(next, controllerId, effect.amount);
+          p.life += gained;
+          if (gained > 0) p.gainedLifeThisTurn = true;
+        }
         next = n;
         break;
       }
@@ -483,6 +490,71 @@ export function applyEffects(
           }
         }
         next = n;
+        break;
+      }
+      case 'searchLibraryHand':
+      case 'searchLibraryTop': {
+        const n = clonePlayers(next);
+        const p = n.players.find((x) => x.id === controllerId);
+        if (p) {
+          const want = effect.cardType;
+          const idx = p.library.findIndex((c) => {
+            if (!want) return true;
+            if (want === 'instant') return /\bInstant\b/i.test(c.card.type_line);
+            if (want === 'sorcery') return /\bSorcery\b/i.test(c.card.type_line);
+            return new RegExp(`\\b${want}\\b`, 'i').test(c.card.type_line);
+          });
+          let found = null as (typeof p.library)[0] | null;
+          if (idx >= 0) {
+            [found] = p.library.splice(idx, 1);
+          }
+          for (let i = p.library.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [p.library[i], p.library[j]] = [p.library[j], p.library[i]];
+          }
+          if (found) {
+            if (effect.type === 'searchLibraryHand') {
+              found.zone = 'hand';
+              p.hand.push(found);
+            } else {
+              found.zone = 'library';
+              p.library.unshift(found);
+            }
+          }
+        }
+        next = n;
+        break;
+      }
+      case 'exileTopMayPlay': {
+        const n = clonePlayers(next);
+        const p = n.players.find((x) => x.id === controllerId);
+        if (p) {
+          const take = Math.min(effect.amount, p.library.length);
+          for (let i = 0; i < take; i++) {
+            const c = p.library.shift()!;
+            c.zone = 'exile';
+            // MVP: mark playable this turn via temp flag on card
+            (c as { mayPlayUntilEndOfTurn?: boolean }).mayPlayUntilEndOfTurn = true;
+            p.exile.push(c);
+          }
+        }
+        next = n;
+        break;
+      }
+      case 'createTreasurePerOppArtifactsEnchantments': {
+        let count = 0;
+        for (const pl of next.players) {
+          if (pl.id === controllerId || pl.hasLost) continue;
+          for (const perm of pl.battlefield) {
+            const tl = perm.card.type_line;
+            if (/\bArtifact\b/i.test(tl) || /\bEnchantment\b/i.test(tl)) count += 1;
+          }
+        }
+        next = createSimpleTokens(next, controllerId, count, {
+          name: 'Treasure',
+          typeline: 'Artifact — Treasure',
+          oracle: '{T}, Sacrifice this artifact: Add {C}.',
+        });
         break;
       }
       case 'scry': {
@@ -1075,13 +1147,80 @@ export function applyEffects(
                 kind: 'spell',
                 controller: controllerId,
                 name: `${src.name} (copy)`,
+                cardInstance: src.cardInstance
+                  ? { ...src.cardInstance, id: `copy_${src.cardInstance.id}_${Date.now()}` }
+                  : undefined,
                 targets: { ...(src.targets || {}) },
                 script: src.script,
+                sourceColors: src.sourceColors ? [...src.sourceColors] : undefined,
               },
             ];
             n.consecutivePasses = 0;
           }
           next = n;
+        }
+        break;
+      }
+      case 'forceSacrifice': {
+        const n = clonePlayers(next);
+        n.pendingChoices = [
+          ...n.pendingChoices,
+          {
+            type: 'sacrificePermanents',
+            playerId: effect.playerId,
+            amount: effect.amount,
+          },
+        ];
+        next = n;
+        break;
+      }
+      case 'optional': {
+        const n = clonePlayers(next);
+        n.pendingChoices = [
+          ...n.pendingChoices,
+          {
+            type: 'optionalEffect',
+            playerId: controllerId,
+            label: effect.label,
+            script: { targets: [], effects: effect.effects },
+            sourcePermanentId: sourcePermanentId,
+          },
+        ];
+        next = n;
+        break;
+      }
+      case 'transform': {
+        let id = sourcePermanentId;
+        if (effect.targetKey) {
+          const t = targets[effect.targetKey];
+          if (t?.kind === 'permanent') id = t.permanentId;
+        }
+        if (id) {
+          const n = clonePlayers(next);
+          const found = findCard(n, id);
+          const perm =
+            found?.zone === 'battlefield'
+              ? found.player.battlefield.find((c) => c.id === id)
+              : undefined;
+          if (perm?.card.other_face) {
+            const back = perm.card.other_face;
+            const front = { ...perm.card, other_face: undefined };
+            perm.card = { ...back, other_face: front };
+            perm.transformed = !perm.transformed;
+            perm.damageMarked = 0;
+            perm.tempPower = 0;
+            perm.tempToughness = 0;
+            perm.tempKeywords = [];
+            if (back.loyalty) {
+              const loy = parseInt(back.loyalty, 10);
+              if (Number.isFinite(loy)) perm.counters['loyalty'] = loy;
+            }
+            if (back.defense) {
+              const def = parseInt(back.defense, 10);
+              if (Number.isFinite(def)) perm.counters['defense'] = def;
+            }
+            next = n;
+          }
         }
         break;
       }
@@ -1303,6 +1442,16 @@ export function applyEffects(
       }
       case 'explore': {
         next = resolveExplore(next, controllerId, effect.targetKey, targets, sourcePermanentId);
+        break;
+      }
+      case 'becomeDay': {
+        const { becomeDay } = require('./dayNight') as typeof import('./dayNight');
+        next = becomeDay(next);
+        break;
+      }
+      case 'becomeNight': {
+        const { becomeNight } = require('./dayNight') as typeof import('./dayNight');
+        next = becomeNight(next);
         break;
       }
       case 'fabricate': {

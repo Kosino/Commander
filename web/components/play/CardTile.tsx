@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, type CSSProperties, type KeyboardEvent } from 'react';
 import type { CardInstance } from '../../lib/engine';
 import { scryfallImageUrl } from '../../lib/cardArt';
 import {
@@ -16,10 +16,16 @@ type Props = {
   legal?: boolean;
   focus?: boolean;
   disabled?: boolean;
+  /** Board sm / default / hand dock size. */
+  size?: 'sm' | 'md' | 'hand';
+  /** Combat lane / arrow chrome. */
+  combatRole?: 'attacking' | 'blocking' | 'defend-target';
   /** When set, card is HTML5-draggable (Arena-style). */
   dragPayload?: PlayDragPayload;
   dropTarget?: boolean;
   onDropPayload?: (payload: PlayDragPayload) => void;
+  className?: string;
+  style?: CSSProperties;
 };
 
 export function CardTile({
@@ -28,9 +34,13 @@ export function CardTile({
   legal,
   focus,
   disabled,
+  size = 'md',
+  combatRole,
   dragPayload,
   dropTarget,
   onDropPayload,
+  className,
+  style,
 }: Props) {
   const [zoom, setZoom] = useState(false);
   const pt =
@@ -45,6 +55,7 @@ export function CardTile({
     .join(' ');
 
   const canDrag = !!dragPayload && !disabled;
+  const inert = disabled || (!onClick && !canDrag && !dropTarget);
   const art =
     card.card.image_uri ||
     (card.faceDown ? null : scryfallImageUrl(card.card.name, 'normal'));
@@ -56,12 +67,23 @@ export function CardTile({
     .filter(Boolean)
     .join('\n');
 
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (inert || !onClick) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      onClick();
+    }
+  };
+
   return (
     <>
-      <button
-        type="button"
-        disabled={disabled || (!onClick && !canDrag && !dropTarget)}
-        onClick={onClick}
+      {/* div not <button>: HTML5 drag from <button> is broken in Chrome/Firefox */}
+      <div
+        role="button"
+        tabIndex={inert ? -1 : 0}
+        aria-disabled={inert || undefined}
+        onClick={inert ? undefined : onClick}
+        onKeyDown={onKeyDown}
         onContextMenu={(e) => {
           e.preventDefault();
           if (!card.faceDown) setZoom(true);
@@ -74,6 +96,7 @@ export function CardTile({
         onDragStart={
           canDrag
             ? (e) => {
+                e.stopPropagation();
                 const raw = encodePlayDrag(dragPayload!);
                 e.dataTransfer.setData(PLAY_DND_MIME, raw);
                 e.dataTransfer.setData('text/plain', raw);
@@ -87,6 +110,7 @@ export function CardTile({
           dropTarget && onDropPayload
             ? (e) => {
                 e.preventDefault();
+                e.stopPropagation();
                 e.dataTransfer.dropEffect = 'move';
                 e.currentTarget.classList.add('play-card--drop');
               }
@@ -106,26 +130,35 @@ export function CardTile({
               }
             : undefined
         }
+        data-card-id={card.id}
         className={[
           'play-card',
+          size === 'sm' ? 'play-card--sm' : '',
+          size === 'hand' ? 'play-card--hand' : '',
           card.tapped ? 'play-card--tapped' : '',
           legal ? 'play-card--legal' : '',
           focus ? 'play-card--focus' : '',
           canDrag ? 'play-card--draggable' : '',
           art ? 'play-card--art' : '',
+          combatRole === 'attacking' ? 'play-card--attacking' : '',
+          combatRole === 'blocking' ? 'play-card--blocking' : '',
+          combatRole === 'defend-target' ? 'play-card--defend-target' : '',
+          inert ? 'play-card--inert' : '',
+          className ?? '',
         ]
           .filter(Boolean)
           .join(' ')}
         title={tip}
-        style={
-          art
+        style={{
+          ...(art
             ? {
                 backgroundImage: `linear-gradient(to top, rgba(8,12,10,.92) 0%, rgba(8,12,10,.35) 45%, transparent 70%), url(${art})`,
                 backgroundSize: 'cover',
                 backgroundPosition: 'center top',
               }
-            : undefined
-        }
+            : {}),
+          ...style,
+        }}
       >
         <div className="play-card__name">{card.card.name}</div>
         <div className="play-card__meta">
@@ -133,9 +166,13 @@ export function CardTile({
           {pt ? ` · ${pt}` : ''}
           {card.damageMarked > 0 ? ` · dmg ${card.damageMarked}` : ''}
           {counters ? ` · ${counters}` : ''}
+          {card.classLevel != null && card.classLevel > 0
+            ? ` · L${card.classLevel}`
+            : ''}
+          {card.solved ? ' · solved' : ''}
           {card.isCompanion ? ' · companion' : ''}
         </div>
-      </button>
+      </div>
       {zoom && art && (
         <div
           className="play-card-zoom"

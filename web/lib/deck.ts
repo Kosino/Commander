@@ -11,10 +11,14 @@ export interface Card {
   oracle_text?: string;
   power?: string;
   toughness?: string;
+  loyalty?: string;
+  defense?: string;
   color_identity?: string[];
   oracle_id?: string;
   keywords?: string[];
   image_uri?: string;
+  /** Back face for DFC / Siege. */
+  other_face?: Card;
 }
 
 export interface DeckExport {

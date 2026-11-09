@@ -82,6 +82,15 @@ export function listLegalTargets(
     }
   }
 
+  if (filter === 'cardInYourGy' && caster) {
+    const p = state.players.find((x) => x.id === caster);
+    if (p) {
+      for (const c of p.graveyard) {
+        out.push({ kind: 'permanent', permanentId: c.id });
+      }
+    }
+  }
+
   if (filter === 'cardInAnyGy') {
     for (const p of state.players) {
       for (const c of p.graveyard) {

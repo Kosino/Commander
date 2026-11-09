@@ -1,6 +1,15 @@
 import {
   GameState,
   activateManaAbility,
+  autoTapForPendingCast,
+  confirmAdditionalCost,
+  confirmCastPay,
+  dropBlockerOnAttacker,
+  setAttackerDefendTarget,
+  setHybridPick,
+  setPreferPhyrexianLife,
+  toggleCostDiscard,
+  toggleCostSacrifice,
   beginActivate,
   beginLoyalty,
   cancelLoyalty,
@@ -41,6 +50,9 @@ import {
   resolveMulliganTake,
   resolveRiotChoice,
   resolveSacrificePermanents,
+  resolveDevourChoice,
+  resolveOptionalEffect,
+  resolveBattleProtector,
   resolveFabricateChoice,
   resolveLookAtTopChoice,
   resolveScryChoice,
@@ -53,9 +65,20 @@ import {
   setCastBuyback,
   setDefendPlayer,
   setDefendPlaneswalker,
+  setDefendBattle,
+  toggleStop,
+  setFullControl,
+  armHoldPriority,
+  clearHoldPriority,
+  setPassTurnMode,
+  onPlayerPassed,
+  onPlayerTookAction,
+  ensurePlayerClocks,
   toggleConvokeCreature,
   toggleImproviseArtifact,
   toggleDelveCard,
+  toggleEscapeExile,
+  confirmEscapeExile,
   confirmConvokeDelve,
   toggleDraftAttacker,
   toggleDraftBlocker,
@@ -118,7 +141,7 @@ function startMatch(room: Room): void {
       name: room.names[seat] || seat,
     })),
   );
-  room.state = givePriority(g, g.activePlayerIndex);
+  room.state = givePriority(ensurePlayerClocks(g), g.activePlayerIndex);
   room.version += 1;
 }
 
@@ -294,13 +317,26 @@ export function viewForSeat(room: Room, seat: SeatId): {
   };
 }
 
-function actorOk(state: GameState, seat: SeatId, _action: RoomAction): boolean {
+function actorOk(state: GameState, seat: SeatId, action: RoomAction): boolean {
+  // Clock / stop settings anytime for your seat
+  if (
+    action.type === 'toggleStop' ||
+    action.type === 'setFullControl' ||
+    action.type === 'armHoldPriority' ||
+    action.type === 'clearHoldPriority' ||
+    action.type === 'setPassTurnMode'
+  ) {
+    return true;
+  }
   if (state.pendingChoices.length > 0) {
     return state.pendingChoices[0].playerId === seat;
   }
   if (state.pendingCast) return state.pendingCast.playerId === seat;
   if (state.combat?.mode === 'declareAttackers' || state.combat?.mode === 'declareBlockers') {
     return state.combat.declaringPlayerId === seat;
+  }
+  if (state.combat?.mode === 'assignDamage') {
+    return state.players[state.activePlayerIndex]?.id === seat;
   }
   return state.players[state.priorityPlayerIndex]?.id === seat;
 }
@@ -322,7 +358,22 @@ export function applyRoomAction(
   let s = room.state;
   switch (action.type) {
     case 'pass':
-      s = passPriority(s);
+      s = onPlayerPassed(passPriority(ensurePlayerClocks(s)), seat);
+      break;
+    case 'toggleStop':
+      s = toggleStop(ensurePlayerClocks(s), seat, action.key);
+      break;
+    case 'setFullControl':
+      s = setFullControl(ensurePlayerClocks(s), seat, action.on);
+      break;
+    case 'armHoldPriority':
+      s = armHoldPriority(ensurePlayerClocks(s), seat);
+      break;
+    case 'clearHoldPriority':
+      s = clearHoldPriority(ensurePlayerClocks(s), seat);
+      break;
+    case 'setPassTurnMode':
+      s = setPassTurnMode(ensurePlayerClocks(s), seat, action.mode);
       break;
     case 'playLand':
       s = playLand(s, seat, action.cardId);
@@ -412,12 +463,43 @@ export function applyRoomAction(
     case 'cancelCast':
       s = cancelCast(s);
       break;
+    case 'confirmCastPay':
+      if (s.pendingCast?.playerId === seat) s = confirmCastPay(s);
+      break;
+    case 'setPreferPhyrexianLife':
+      if (s.pendingCast?.playerId === seat) s = setPreferPhyrexianLife(s, action.prefer);
+      break;
+    case 'setHybridPick':
+      if (s.pendingCast?.playerId === seat) s = setHybridPick(s, action.index, action.color);
+      break;
+    case 'toggleCostDiscard':
+      if (s.pendingCast?.playerId === seat) s = toggleCostDiscard(s, action.cardId);
+      break;
+    case 'toggleCostSacrifice':
+      if (s.pendingCast?.playerId === seat) s = toggleCostSacrifice(s, action.permanentId);
+      break;
+    case 'confirmAdditionalCost':
+      if (s.pendingCast?.playerId === seat) s = confirmAdditionalCost(s);
+      break;
+    case 'setAttackerDefendTarget':
+      s = setAttackerDefendTarget(s, action.attackerId, {
+        defendingPlayerId: action.defendingPlayerId,
+        defendingPlaneswalkerId: action.defendingPlaneswalkerId,
+        defendingBattleId: action.defendingBattleId,
+      });
+      break;
+    case 'dropBlockerOnAttacker':
+      s = dropBlockerOnAttacker(s, action.attackerId, action.blockerId);
+      break;
     case 'activateMana': {
       const before = s;
       s = activateManaAbility(s, seat, action.cardId);
       if (s === before) s = beginActivate(s, seat, action.cardId);
       break;
     }
+    case 'autoTapForPending':
+      if (s.pendingCast?.playerId === seat) s = autoTapForPendingCast(s);
+      break;
     case 'beginActivate':
       s = beginActivate(s, seat, action.cardId);
       break;
@@ -429,6 +511,9 @@ export function applyRoomAction(
       break;
     case 'setDefendPlaneswalker':
       s = setDefendPlaneswalker(s, action.planeswalkerId);
+      break;
+    case 'setDefendBattle':
+      s = setDefendBattle(s, action.battleId);
       break;
     case 'confirmAttackers': {
       const next = confirmAttackers(s);
@@ -506,11 +591,38 @@ export function applyRoomAction(
     case 'resolveSacrificePermanents':
       s = resolveSacrificePermanents(s, action.permanentIds);
       break;
+    case 'resolveDevour':
+      s = resolveDevourChoice(s, action.creatureIds);
+      break;
+    case 'resolveOptionalEffect':
+      s = resolveOptionalEffect(s, action.take);
+      break;
+    case 'resolveBattleProtector':
+      s = resolveBattleProtector(s, action.opponentId);
+      break;
+    case 'toggleEscapeExile':
+      s = toggleEscapeExile(s, action.cardId);
+      break;
+    case 'confirmEscapeExile':
+      s = confirmEscapeExile(s);
+      break;
     case 'moveDraftBlocker':
       s = moveDraftBlocker(s, action.attackerId, action.blockerId, action.direction);
       break;
     default:
       return { error: 'Unknown action' };
+  }
+
+  // Cancel pass-turn "until response" after a real game action
+  if (
+    action.type !== 'pass' &&
+    action.type !== 'toggleStop' &&
+    action.type !== 'setFullControl' &&
+    action.type !== 'armHoldPriority' &&
+    action.type !== 'clearHoldPriority' &&
+    action.type !== 'setPassTurnMode'
+  ) {
+    s = onPlayerTookAction(s, seat);
   }
 
   room.state = s;

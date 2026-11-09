@@ -7,31 +7,66 @@ type Props = {
   className?: string;
   label?: string;
   active?: boolean;
+  /** Shown via CSS when lane is empty (`data-empty`). */
+  emptyHint?: string;
+  /** If set, only these payload sources are handled (others fall through). */
+  acceptSrc?: PlayDragPayload['src'][];
   onDropPayload: (payload: PlayDragPayload) => void;
   children?: ReactNode;
 };
 
-/** Lane / player / stack drop target. */
-export function DropZone({ className, label, active = true, onDropPayload, children }: Props) {
+/**
+ * Lane / player / stack drop target.
+ * dragOver uses capture + preventDefault so child cards cannot block drops.
+ * drop uses bubble so a child CardTile dropTarget can handle combat first.
+ */
+export function DropZone({
+  className,
+  label,
+  active = true,
+  emptyHint,
+  acceptSrc,
+  onDropPayload,
+  children,
+}: Props) {
   const [over, setOver] = useState(false);
+  const dataAttrs = emptyHint ? { 'data-empty': emptyHint } : undefined;
   if (!active) {
-    return <div className={className}>{children}</div>;
+    return (
+      <div className={className} {...dataAttrs}>
+        {children}
+      </div>
+    );
   }
+
+  const accepts = (p: PlayDragPayload) => !acceptSrc || acceptSrc.includes(p.src);
+
   return (
     <div
       className={[className, over ? 'play-drop--over' : ''].filter(Boolean).join(' ')}
       aria-label={label}
-      onDragOver={(e) => {
+      {...dataAttrs}
+      onDragEnterCapture={(e) => {
+        e.preventDefault();
+      }}
+      onDragOverCapture={(e) => {
+        // Must preventDefault in capture so drops work over non-droppable children
         e.preventDefault();
         e.dataTransfer.dropEffect = 'move';
         setOver(true);
       }}
-      onDragLeave={() => setOver(false)}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setOver(false);
+        }
+      }}
       onDrop={(e) => {
-        e.preventDefault();
-        setOver(false);
         const p = readPlayDrag(e.dataTransfer);
-        if (p) onDropPayload(p);
+        if (!p || !accepts(p)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setOver(false);
+        onDropPayload(p);
       }}
     >
       {children}

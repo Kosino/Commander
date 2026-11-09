@@ -1,6 +1,7 @@
 import { CardInstance, GameState, Player, ZoneName } from './types';
 
-function gyBecomesExile(state: GameState): boolean {
+/** Rest in Peace / Leyline of the Void — shared with replacement.ts. */
+export function graveyardBecomesExile(state: GameState): boolean {
   for (const p of state.players) {
     for (const perm of p.battlefield) {
       const t = perm.card.oracle_text || '';
@@ -66,6 +67,12 @@ function clonePlayers(state: GameState): GameState {
       cardInstance: s.cardInstance,
     })),
     pendingChoices: [...state.pendingChoices],
+    playerClocks: Object.fromEntries(
+      Object.entries(state.playerClocks || {}).map(([id, c]) => [
+        id,
+        { ...c, stops: [...(c.stops || [])] },
+      ]),
+    ),
     pendingCast: state.pendingCast
       ? {
           ...state.pendingCast,
@@ -80,9 +87,26 @@ function clonePlayers(state: GameState): GameState {
           delveExiled: state.pendingCast.delveExiled
             ? [...state.pendingCast.delveExiled]
             : undefined,
+          escapeExiled: state.pendingCast.escapeExiled
+            ? [...state.pendingCast.escapeExiled]
+            : undefined,
+          escapeNeeded: state.pendingCast.escapeNeeded,
           improviseTapped: state.pendingCast.improviseTapped
             ? [...state.pendingCast.improviseTapped]
             : undefined,
+          hybridPicks: state.pendingCast.hybridPicks
+            ? [...state.pendingCast.hybridPicks]
+            : undefined,
+          costDiscardIds: state.pendingCast.costDiscardIds
+            ? [...state.pendingCast.costDiscardIds]
+            : undefined,
+          costSacrificeIds: state.pendingCast.costSacrificeIds
+            ? [...state.pendingCast.costSacrificeIds]
+            : undefined,
+          costDiscardNeed: state.pendingCast.costDiscardNeed,
+          costDiscardFilter: state.pendingCast.costDiscardFilter,
+          costSacrificeNeed: state.pendingCast.costSacrificeNeed,
+          preferPhyrexianLife: state.pendingCast.preferPhyrexianLife,
           pendingTrigger: state.pendingCast.pendingTrigger
             ? { ...state.pendingCast.pendingTrigger }
             : undefined,
@@ -96,6 +120,12 @@ function clonePlayers(state: GameState): GameState {
             blockers: [...a.blockers],
           })),
           draftAttackerIds: [...state.combat.draftAttackerIds],
+          draftAttackTargets: Object.fromEntries(
+            Object.entries(state.combat.draftAttackTargets || {}).map(([k, v]) => [
+              k,
+              { ...v },
+            ]),
+          ),
           draftBlocks: Object.fromEntries(
             Object.entries(state.combat.draftBlocks).map(([k, v]) => [k, [...v]]),
           ),
@@ -105,6 +135,8 @@ function clonePlayers(state: GameState): GameState {
     monarchPlayerId: state.monarchPlayerId,
     creatureDiedThisTurn: state.creatureDiedThisTurn,
     spellsCastThisTurn: state.spellsCastThisTurn,
+    spellsCastPreviousTurn: state.spellsCastPreviousTurn,
+    dayNight: state.dayNight ?? null,
     preventionShields: state.preventionShields.map((s) => ({ ...s })),
     redirectShields: (state.redirectShields || []).map((s) => ({ ...s })),
     preventCombatDamageThisTurn: !!state.preventCombatDamageThisTurn,
@@ -144,7 +176,7 @@ export function moveCard(
         card.unearthed = false;
       }
       // Rest in Peace-style: would enter GY → exile instead (614)
-      if (dest === 'graveyard' && gyBecomesExile(next)) {
+      if (dest === 'graveyard' && graveyardBecomesExile(next)) {
         dest = 'exile';
       }
       card.zone = dest;

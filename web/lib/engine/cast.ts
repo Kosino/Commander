@@ -13,7 +13,9 @@ import {
   hasRiot,
   hasSplitSecond,
   hasStorm,
+  isClass,
   isSaga,
+  hasDaybound,
   manaCostHasX,
   oracleEntersTapped,
   overloadScript,
@@ -59,8 +61,11 @@ import {
   effectivePower,
   GameState,
   hasKeyword,
+  isBattle,
   isCreature,
+  isSiege,
   ManaColor,
+  parseDefense,
   StackObject,
 } from './types';
 import {
@@ -72,7 +77,17 @@ import {
 } from './triggers';
 import { resolveSagaChapter } from './saga';
 import { totalWardCost, withWardGate } from './ward';
-import { clonePlayers, findCard, moveCard } from './zones';
+import { clonePlayers, findCard, graveyardBecomesExile, moveCard } from './zones';
+
+function pushToGyOrExile(state: GameState, player: { graveyard: CardInstance[]; exile: CardInstance[] }, card: CardInstance): void {
+  if (graveyardBecomesExile(state)) {
+    card.zone = 'exile';
+    player.exile.push(card);
+  } else {
+    card.zone = 'graveyard';
+    player.graveyard.push(card);
+  }
+}
 
 let _stackSeq = 0;
 function nextStackId(): string {
@@ -130,9 +145,24 @@ type CastFrom =
   | 'spectacle'
   | 'embalm'
   | 'evoke'
-  | 'overload';
+  | 'overload'
+  | 'cascade';
 
 function spellCost(instance: CardInstance, from: CastFrom, xValue = 0): ManaCost {
+  if (from === 'cascade') {
+    return {
+      generic: 0,
+      W: 0,
+      U: 0,
+      B: 0,
+      R: 0,
+      G: 0,
+      C: 0,
+      hybrids: [],
+      phyrexian: [],
+      unpayable: false,
+    };
+  }
   if (from === 'flashback') {
     return parseManaCost(parseFlashbackCost(instance.card.oracle_text) || undefined, xValue);
   }
@@ -221,13 +251,96 @@ type CastPhase =
   | 'convoke'
   | 'improvise'
   | 'delve'
+  | 'escapeExile'
   | 'targets'
+  | 'additionalCost'
+  | 'pay'
   | 'done';
+
+function computeAdditionalCostNeeds(
+  state: GameState,
+  pending: NonNullable<GameState['pendingCast']>,
+): {
+  discardNeed: number;
+  discardFilter: 'any' | 'land';
+  sacrificeNeed: number;
+} {
+  let discardNeed = 0;
+  let discardFilter: 'any' | 'land' = 'any';
+  let sacrificeNeed = 0;
+  if (pending.from === 'jumpstart') discardNeed += 1;
+  if (pending.from === 'retrace') {
+    discardNeed += 1;
+    discardFilter = 'land';
+  }
+  const card = findCastable(
+    state,
+    pending.playerId,
+    pending.cardId,
+    pending.from as CastFrom,
+  );
+  if (card) {
+    const extra = parseAdditionalCosts(card.card.oracle_text);
+    if (extra.discard) discardNeed += extra.discard;
+    if (extra.sacrificeCreature) sacrificeNeed += 1;
+  }
+  return { discardNeed, discardFilter, sacrificeNeed };
+}
+
+/** Arena: after announce/targets → additional-cost picks (if any) → pay. */
+function toPayPhase(
+  state: GameState,
+  pending: NonNullable<GameState['pendingCast']>,
+  merged: SpellScript,
+  chosen: Record<string, TargetRef>,
+): GameState {
+  const needs = computeAdditionalCostNeeds(state, pending);
+  if (needs.discardNeed > 0 || needs.sacrificeNeed > 0) {
+    const alreadyOk =
+      (pending.costDiscardIds?.length || 0) >= needs.discardNeed &&
+      (pending.costSacrificeIds?.length || 0) >= needs.sacrificeNeed;
+    if (!alreadyOk) {
+      return {
+        ...state,
+        pendingCast: {
+          ...pending,
+          resolvedScript: merged,
+          chosen,
+          phase: 'additionalCost',
+          slots: [],
+          currentSlot: 0,
+          costDiscardNeed: needs.discardNeed,
+          costDiscardFilter: needs.discardFilter,
+          costDiscardIds: pending.costDiscardIds || [],
+          costSacrificeNeed: needs.sacrificeNeed,
+          costSacrificeIds: pending.costSacrificeIds || [],
+        },
+      };
+    }
+  }
+  let next: GameState = {
+    ...state,
+    pendingCast: {
+      ...pending,
+      resolvedScript: merged,
+      chosen,
+      phase: 'pay',
+      slots: [],
+      currentSlot: 0,
+      costDiscardNeed: needs.discardNeed,
+      costDiscardFilter: needs.discardFilter,
+      costSacrificeNeed: needs.sacrificeNeed,
+    },
+  };
+  const cost = pendingSpellManaCost(next);
+  if (cost) next = autoTapManaForCost(next, pending.playerId, cost);
+  return next;
+}
 
 function nextCastPhase(
   script: SpellScript,
-  after: 'start' | 'mode' | 'x' | 'kicker' | 'buyback' | 'convoke' | 'improvise' | 'delve',
-  flags?: { convoke?: boolean; improvise?: boolean; delve?: boolean },
+  after: 'start' | 'mode' | 'x' | 'kicker' | 'buyback' | 'convoke' | 'improvise' | 'delve' | 'escapeExile',
+  flags?: { convoke?: boolean; improvise?: boolean; delve?: boolean; escapeExile?: boolean },
 ): CastPhase {
   const hasModes = !!(script.modes && script.modes.length > 0);
   const hasX = !!script.hasX;
@@ -236,7 +349,9 @@ function nextCastPhase(
   const wantConvoke = !!flags?.convoke;
   const wantImprovise = !!flags?.improvise;
   const wantDelve = !!flags?.delve;
+  const wantEscape = !!flags?.escapeExile;
   const afterAnnounce = (): CastPhase => {
+    if (wantEscape) return 'escapeExile';
     if (wantConvoke) return 'convoke';
     if (wantImprovise) return 'improvise';
     if (wantDelve) return 'delve';
@@ -248,6 +363,12 @@ function nextCastPhase(
     if (hasKicker) return 'kicker';
     if (hasBuyback) return 'buyback';
     return afterAnnounce();
+  }
+  if (after === 'escapeExile') {
+    if (wantConvoke) return 'convoke';
+    if (wantImprovise) return 'improvise';
+    if (wantDelve) return 'delve';
+    return script.targets.length ? 'targets' : 'done';
   }
   if (after === 'mode') {
     if (hasX) return 'x';
@@ -385,7 +506,12 @@ function findCastable(
     from === 'escape' ||
     from === 'retrace' ||
     from === 'embalm';
-  const list = from === 'command' ? player.commandZone : gy ? player.graveyard : player.hand;
+  const list =
+    from === 'command'
+      ? player.commandZone
+      : gy
+        ? player.graveyard
+        : player.hand; // cascade also casts from hand (revealed card parked there)
   return list.find((c) => c.id === cardId) || null;
 }
 
@@ -405,6 +531,62 @@ function parseTapAddMana(oracle?: string): Partial<Record<ManaColor, number>> | 
     }
   }
   return Object.keys(add).length ? add : null;
+}
+
+function producesManaColors(perm: CardInstance): ManaColor[] {
+  const basic = basicLandMana(perm.card.type_line);
+  if (basic && perm.card.type_line.includes('Land')) return [basic];
+  if (/treasure/i.test(perm.card.type_line)) return ['C'];
+  if (perm.card.name.toLowerCase().includes('sol ring')) return ['C', 'C'];
+  const add = parseTapAddMana(perm.card.oracle_text);
+  if (!add) return [];
+  const out: ManaColor[] = [];
+  for (const [c, n] of Object.entries(add)) {
+    for (let i = 0; i < (n || 0); i++) out.push(c as ManaColor);
+  }
+  return out;
+}
+
+/**
+ * Arena auto-tap: tap lands/rocks until `cost` is payable (or no useful source left).
+ */
+export function autoTapManaForCost(
+  state: GameState,
+  playerId: string,
+  cost: ManaCost,
+): GameState {
+  let next = state;
+  for (let guard = 0; guard < 40; guard++) {
+    const p = next.players.find((x) => x.id === playerId);
+    if (!p) return next;
+    if (canPayMana(p.manaPool, cost, p.life)) return next;
+
+    const need: ManaColor[] = [];
+    for (const c of ['W', 'U', 'B', 'R', 'G', 'C'] as ManaColor[]) {
+      const short = cost[c] - (p.manaPool[c] || 0);
+      for (let i = 0; i < short; i++) need.push(c);
+    }
+    const candidates = p.battlefield.filter(
+      (c) => !c.tapped && producesManaColors(c).length > 0,
+    );
+    if (!candidates.length) return next;
+
+    let pick =
+      need.length > 0
+        ? candidates.find((c) => producesManaColors(c).some((col) => need.includes(col)))
+        : null;
+    if (!pick) {
+      pick =
+        candidates.find((c) => producesManaColors(c).includes('C')) ||
+        candidates.find((c) => c.card.type_line.includes('Land')) ||
+        candidates[0];
+    }
+    if (!pick) return next;
+    const tapped = activateManaAbility(next, playerId, pick.id);
+    if (tapped === next) return next;
+    next = tapped;
+  }
+  return next;
 }
 
 /** Mana ability: tap basic land, Sol Ring, or `{T}: Add …`. Allowed during targeting (Arena). */
@@ -458,15 +640,8 @@ export function activateManaAbility(
     player.manaPool[c as keyof typeof player.manaPool] += n || 0;
   }
   if (sacrificeAfter) {
-    const idx = player.battlefield.findIndex((c) => c.id === permanentId);
-    if (idx >= 0) {
-      const [tok] = player.battlefield.splice(idx, 1);
-      // tokens cease; non-tokens to GY
-      if (!tok.isToken) {
-        tok.zone = 'graveyard';
-        player.graveyard.push(tok);
-      }
-    }
+    // RIP / tokens — go through moveCard
+    return moveCard(next, permanentId, 'graveyard').state;
   }
   return next;
 }
@@ -552,6 +727,7 @@ function beginCastFrom(
                   ? parseEmbalmCost(card.card.oracle_text) || undefined
                   : card.card.mana_cost;
   const kw = castKeywordFlags(card);
+  const esc = from === 'escape' ? parseEscape(card.card.oracle_text) : null;
   if (!canAffordCost(state, playerId, cost, manaStr, { ...kw, card })) return state;
 
   // Embalm is an activated ability → token copy (no stack targets from spell script)
@@ -576,10 +752,30 @@ function beginCastFrom(
     dash: ' (Dash)',
     blitz: ' (Blitz)',
     spectacle: ' (Spec)',
+    cascade: ' (cascade)',
   };
-  const phase = nextCastPhase(script, 'start', kw);
+  const phase = nextCastPhase(script, 'start', {
+    ...kw,
+    escapeExile: from === 'escape' && !!esc && esc.exile > 0,
+  });
+  const basePending: NonNullable<GameState['pendingCast']> = {
+    playerId,
+    cardId,
+    cardName: `${card.card.name}${tagMap[from] || ''}`,
+    slots: phase === 'targets' ? script.targets : [],
+    chosen: {},
+    currentSlot: 0,
+    from,
+    sourceColors,
+    phase: phase === 'done' ? 'pay' : phase,
+    resolvedScript: script,
+    convokeTapped: [],
+    delveExiled: [],
+    escapeExiled: [],
+    escapeNeeded: esc?.exile || 0,
+  };
   if (phase === 'done') {
-    return finalizeCast(state, playerId, cardId, {}, script, from);
+    return toPayPhase(state, basePending, script, {});
   }
   if (phase === 'targets') {
     for (const slot of script.targets) {
@@ -588,20 +784,7 @@ function beginCastFrom(
   }
   return {
     ...state,
-    pendingCast: {
-      playerId,
-      cardId,
-      cardName: `${card.card.name}${tagMap[from] || ''}`,
-      slots: phase === 'targets' ? script.targets : [],
-      chosen: {},
-      currentSlot: 0,
-      from,
-      sourceColors,
-      phase,
-      resolvedScript: script,
-      convokeTapped: [],
-      delveExiled: [],
-    },
+    pendingCast: basePending,
   };
 }
 
@@ -617,26 +800,29 @@ function advanceAfterAnnounce(
   state: GameState,
   pending: NonNullable<GameState['pendingCast']>,
   merged: SpellScript,
-  after: 'mode' | 'x' | 'kicker' | 'buyback' | 'convoke' | 'improvise' | 'delve',
+  after: 'mode' | 'x' | 'kicker' | 'buyback' | 'convoke' | 'improvise' | 'delve' | 'escapeExile',
   extra: Partial<NonNullable<GameState['pendingCast']>> = {},
 ): GameState {
   const kw = pendingKwFlags(state, pending);
-  const phase = nextCastPhase(merged, after, kw);
+  const phase = nextCastPhase(merged, after, {
+    ...kw,
+    escapeExile: false, // already handled
+  });
   if (phase === 'done') {
-    return finalizeCast(
-      { ...state, pendingCast: null },
-      pending.playerId,
-      pending.cardId,
-      pending.chosen,
+    return toPayPhase(
+      state,
+      {
+        ...pending,
+        ...extra,
+        resolvedScript: merged,
+        convokeTapped: extra.convokeTapped ?? pending.convokeTapped,
+        delveExiled: extra.delveExiled ?? pending.delveExiled,
+        improviseTapped: extra.improviseTapped ?? pending.improviseTapped,
+        payBuyback: extra.payBuyback ?? pending.payBuyback,
+        escapeExiled: extra.escapeExiled ?? pending.escapeExiled,
+      },
       merged,
-      pending.from as CastFrom,
-      undefined,
-      pending.xValue || 0,
-      !!pending.payKicker,
-      extra.convokeTapped ?? pending.convokeTapped,
-      extra.delveExiled ?? pending.delveExiled,
-      extra.improviseTapped ?? pending.improviseTapped,
-      extra.payBuyback ?? pending.payBuyback,
+      pending.chosen,
     );
   }
   if (phase === 'targets') {
@@ -744,6 +930,36 @@ export function toggleDelveCard(state: GameState, cardId: string): GameState {
   };
 }
 
+/** Toggle a GY card for Escape additional cost. */
+export function toggleEscapeExile(state: GameState, cardId: string): GameState {
+  const pending = state.pendingCast;
+  if (!pending || pending.phase !== 'escapeExile') return state;
+  if (cardId === pending.cardId) return state;
+  const gy = state.players.find((p) => p.id === pending.playerId)?.graveyard;
+  if (!gy?.some((c) => c.id === cardId)) return state;
+  const set = new Set(pending.escapeExiled || []);
+  const need = pending.escapeNeeded || 0;
+  if (set.has(cardId)) set.delete(cardId);
+  else if (set.size < need) set.add(cardId);
+  return {
+    ...state,
+    pendingCast: { ...pending, escapeExiled: [...set] },
+  };
+}
+
+/** Finish Escape exile selection → announce / targets / finalize. */
+export function confirmEscapeExile(state: GameState): GameState {
+  const pending = state.pendingCast;
+  if (!pending || pending.phase !== 'escapeExile') return state;
+  const need = pending.escapeNeeded || 0;
+  if ((pending.escapeExiled || []).length < need) return state;
+  const base = pending.resolvedScript || { targets: [], effects: [] };
+  const merged = mergeScript(base, pending.modeIndex, pending.payKicker);
+  return advanceAfterAnnounce(state, pending, merged, 'escapeExile', {
+    escapeExiled: pending.escapeExiled,
+  });
+}
+
 /** Toggle an artifact for improvise payment. */
 export function toggleImproviseArtifact(state: GameState, permanentId: string): GameState {
   const pending = state.pendingCast;
@@ -764,6 +980,7 @@ export function toggleImproviseArtifact(state: GameState, permanentId: string): 
 /** Finish convoke/improvise/delve selection → targets or finalize. */
 export function confirmConvokeDelve(state: GameState): GameState {
   const pending = state.pendingCast;
+  if (pending?.phase === 'escapeExile') return confirmEscapeExile(state);
   if (
     !pending ||
     (pending.phase !== 'convoke' &&
@@ -969,6 +1186,144 @@ export function cancelCast(state: GameState): GameState {
   return { ...state, pendingCast: null };
 }
 
+/** Arena: toggle Phyrexian pay-with-life preference during pay step. */
+export function setPreferPhyrexianLife(state: GameState, prefer: boolean): GameState {
+  const pending = state.pendingCast;
+  if (!pending || pending.phase !== 'pay') return state;
+  return { ...state, pendingCast: { ...pending, preferPhyrexianLife: prefer } };
+}
+
+/** Arena: pick color for hybrid symbol index during pay. */
+export function setHybridPick(
+  state: GameState,
+  index: number,
+  color: ManaColor,
+): GameState {
+  const pending = state.pendingCast;
+  if (!pending || pending.phase !== 'pay') return state;
+  const cost = pendingSpellManaCost(state);
+  const hybrids = cost?.hybrids || [];
+  if (index < 0 || index >= hybrids.length) return state;
+  const h = hybrids[index];
+  if (color !== h.a && color !== h.b) return state;
+  const picks = [...(pending.hybridPicks || [])];
+  // Sparse until every hybrid index is chosen (Arena gem-by-gem)
+  while (picks.length <= index) picks.push(undefined as unknown as ManaColor);
+  picks[index] = color;
+  return { ...state, pendingCast: { ...pending, hybridPicks: picks } };
+}
+
+/** Pick a hand card for jump-start / retrace / discard additional cost. */
+export function toggleCostDiscard(state: GameState, cardId: string): GameState {
+  const pending = state.pendingCast;
+  if (!pending || pending.phase !== 'additionalCost') return state;
+  const need = pending.costDiscardNeed || 0;
+  if (need <= 0) return state;
+  if (cardId === pending.cardId) return state;
+  const player = state.players.find((p) => p.id === pending.playerId);
+  const card = player?.hand.find((c) => c.id === cardId);
+  if (!card) return state;
+  if (pending.costDiscardFilter === 'land' && !card.card.type_line.includes('Land')) {
+    return state;
+  }
+  const picked = [...(pending.costDiscardIds || [])];
+  const idx = picked.indexOf(cardId);
+  if (idx >= 0) picked.splice(idx, 1);
+  else if (picked.length < need) picked.push(cardId);
+  else {
+    picked.shift();
+    picked.push(cardId);
+  }
+  return { ...state, pendingCast: { ...pending, costDiscardIds: picked } };
+}
+
+/** Pick a creature to sacrifice as additional cost. */
+export function toggleCostSacrifice(state: GameState, permanentId: string): GameState {
+  const pending = state.pendingCast;
+  if (!pending || pending.phase !== 'additionalCost') return state;
+  const need = pending.costSacrificeNeed || 0;
+  if (need <= 0) return state;
+  const player = state.players.find((p) => p.id === pending.playerId);
+  const perm = player?.battlefield.find((c) => c.id === permanentId);
+  if (!perm || !isCreature(perm)) return state;
+  const picked = [...(pending.costSacrificeIds || [])];
+  const idx = picked.indexOf(permanentId);
+  if (idx >= 0) picked.splice(idx, 1);
+  else if (picked.length < need) picked.push(permanentId);
+  else {
+    picked.shift();
+    picked.push(permanentId);
+  }
+  return { ...state, pendingCast: { ...pending, costSacrificeIds: picked } };
+}
+
+/** Confirm additional-cost picks → pay phase. */
+export function confirmAdditionalCost(state: GameState): GameState {
+  const pending = state.pendingCast;
+  if (!pending || pending.phase !== 'additionalCost') return state;
+  const needD = pending.costDiscardNeed || 0;
+  const needS = pending.costSacrificeNeed || 0;
+  if ((pending.costDiscardIds || []).length < needD) return state;
+  if ((pending.costSacrificeIds || []).length < needS) return state;
+  const merged =
+    pending.resolvedScript ||
+    parseOracleScript(
+      findCastable(state, pending.playerId, pending.cardId, pending.from as CastFrom)?.card
+        .oracle_text,
+      findCastable(state, pending.playerId, pending.cardId, pending.from as CastFrom)?.card
+        .type_line,
+      findCastable(state, pending.playerId, pending.cardId, pending.from as CastFrom)?.card
+        .mana_cost,
+    );
+  return toPayPhase(state, pending, mergeScript(merged, pending.modeIndex, pending.payKicker), pending.chosen);
+}
+
+/** Arena: confirm mana payment → put spell on stack. Keeps pay UI if unaffordable. */
+export function confirmCastPay(state: GameState): GameState {
+  const pending = state.pendingCast;
+  if (!pending || pending.phase !== 'pay') return state;
+  if (
+    pending.from === 'ability' ||
+    pending.from === 'equip' ||
+    pending.from === 'crew' ||
+    pending.from === 'trigger'
+  ) {
+    return state;
+  }
+  const from = pending.from as CastFrom;
+  const script =
+    pending.resolvedScript ||
+    parseOracleScript(
+      findCastable(state, pending.playerId, pending.cardId, from)?.card.oracle_text,
+      findCastable(state, pending.playerId, pending.cardId, from)?.card.type_line,
+      findCastable(state, pending.playerId, pending.cardId, from)?.card.mana_cost,
+    );
+  const merged = mergeScript(script, pending.modeIndex, pending.payKicker);
+  const result = finalizeCast(
+    state,
+    pending.playerId,
+    pending.cardId,
+    pending.chosen,
+    merged,
+    from,
+    {
+      preferPhyrexianLife: !!pending.preferPhyrexianLife,
+      hybridPicks: pending.hybridPicks,
+      keepPayOnFail: true,
+      costDiscardIds: pending.costDiscardIds,
+      costSacrificeIds: pending.costSacrificeIds,
+    },
+    pending.xValue || 0,
+    !!pending.payKicker,
+    pending.convokeTapped,
+    pending.delveExiled,
+    pending.improviseTapped,
+    !!pending.payBuyback,
+    pending.escapeExiled,
+  );
+  return result;
+}
+
 /** Arena: click legal target while casting. */
 export function selectCastTarget(state: GameState, target: TargetRef): GameState {
   const pending = state.pendingCast;
@@ -984,6 +1339,9 @@ export function selectCastTarget(state: GameState, target: TargetRef): GameState
   }
   if (pending.phase === 'delve' && target.kind === 'permanent') {
     return toggleDelveCard(state, target.permanentId);
+  }
+  if (pending.phase === 'escapeExile' && target.kind === 'permanent') {
+    return toggleEscapeExile(state, target.permanentId);
   }
   const slot = pending.slots[pending.currentSlot];
   if (!slot) return state;
@@ -1013,6 +1371,7 @@ export function selectCastTarget(state: GameState, target: TargetRef): GameState
     'blitz',
     'spectacle',
     'embalm',
+    'cascade',
   ];
   const from: CastFrom = castFroms.includes(pending.from as CastFrom)
     ? (pending.from as CastFrom)
@@ -1027,21 +1386,7 @@ export function selectCastTarget(state: GameState, target: TargetRef): GameState
         findCastable(state, pending.playerId, pending.cardId, from)?.card.mana_cost,
       );
     const merged = mergeScript(script, pending.modeIndex, pending.payKicker);
-    return finalizeCast(
-      { ...state, pendingCast: null },
-      pending.playerId,
-      pending.cardId,
-      chosen,
-      merged,
-      from,
-      undefined,
-      pending.xValue || 0,
-      !!pending.payKicker,
-      pending.convokeTapped,
-      pending.delveExiled,
-      pending.improviseTapped,
-      !!pending.payBuyback,
-    );
+    return toPayPhase(state, { ...pending, chosen }, merged, chosen);
   }
 
   return {
@@ -1072,26 +1417,39 @@ function runCascade(state: GameState, playerId: string, mv: number): GameState {
   }
   if (!found) return next;
   const script = parseOracleScript(found.card.oracle_text, found.card.type_line);
-  // MVP: targetless → cast free onto stack; else put in hand
-  if (script.targets.length > 0) {
-    found.zone = 'hand';
-    p.hand.push(found);
+  // Park in hand; cast free (cascade). Targeted → pendingCast for Arena targeting.
+  found.zone = 'hand';
+  p.hand.push(found);
+  if (script.targets.length === 0) {
+    return finalizeCast(next, playerId, found.id, {}, script, 'cascade');
+  }
+  if (next.pendingCast) {
+    // Already casting — leave in hand (player can cast later)
     return next;
   }
-  found.zone = 'stack';
-  next.stack = [
-    ...next.stack,
-    {
-      id: nextStackId(),
-      kind: 'spell',
-      controller: playerId,
-      name: `${found.card.name} (cascade)`,
-      cardInstance: found,
-      targets: {},
-      script,
+  for (const slot of script.targets) {
+    if (listLegalTargets(next, slot.filter, playerId, found.card.colors || []).length === 0) {
+      return next; // stay in hand
+    }
+  }
+  return {
+    ...next,
+    pendingCast: {
+      playerId,
+      cardId: found.id,
+      cardName: `${found.card.name} (cascade)`,
+      slots: script.targets,
+      chosen: {},
+      currentSlot: 0,
+      from: 'cascade',
+      sourceColors: found.card.colors || [],
+      phase: 'targets',
+      resolvedScript: script,
+      convokeTapped: [],
+      delveExiled: [],
+      escapeExiled: [],
     },
-  ];
-  return next;
+  };
 }
 
 function finalizeCast(
@@ -1101,19 +1459,31 @@ function finalizeCast(
   targets: Record<string, TargetRef>,
   scriptIn: ReturnType<typeof parseOracleScript>,
   from: CastFrom = 'hand',
-  opts?: { skipWardCheck?: boolean },
+  opts?: {
+    skipWardCheck?: boolean;
+    preferPhyrexianLife?: boolean;
+    hybridPicks?: ManaColor[];
+    keepPayOnFail?: boolean;
+    costDiscardIds?: string[];
+    costSacrificeIds?: string[];
+  },
   xValue = 0,
   payKicker = false,
   convokeTapped?: string[],
   delveExiled?: string[],
   improviseTapped?: string[],
   payBuyback = false,
+  escapeExiled?: string[],
 ): GameState {
+  const fail = (): GameState =>
+    opts?.keepPayOnFail && state.pendingCast
+      ? state
+      : { ...state, pendingCast: null };
   let script = scriptIn;
   const player = state.players.find((p) => p.id === playerId);
-  if (!player) return state;
+  if (!player) return fail();
   const card = findCastable(state, playerId, cardId, from);
-  if (!card) return { ...state, pendingCast: null };
+  if (!card) return fail();
 
   if (from === 'overload') {
     script = overloadScript(script);
@@ -1122,14 +1492,14 @@ function finalizeCast(
   const extraCosts = parseAdditionalCosts(card.card.oracle_text);
   if (extraCosts.sacrificeCreature) {
     if (!player.battlefield.some((c) => isCreature(c))) {
-      return { ...state, pendingCast: null };
+      return fail();
     }
   }
   if (extraCosts.discard && player.hand.filter((c) => c.id !== cardId).length < extraCosts.discard) {
-    return { ...state, pendingCast: null };
+    return fail();
   }
   if (extraCosts.payLife && player.life <= extraCosts.payLife) {
-    return { ...state, pendingCast: null };
+    return fail();
   }
 
   let cost = spellCost(card, from, xValue);
@@ -1205,15 +1575,25 @@ function finalizeCast(
     convokeCreatures,
     delveIds.length + improviseArts.length,
   );
-  if (!canPayMana(player.manaPool, reduced, player.life)) {
-    return { ...state, pendingCast: null };
+  // Arena auto-tap: fill pool from untapped lands/rocks before paying
+  const payState = autoTapManaForCost(state, playerId, reduced);
+  const payer = payState.players.find((p) => p.id === playerId);
+  if (!payer || !canPayMana(payer.manaPool, reduced, payer.life)) {
+    return opts?.keepPayOnFail ? payState : fail();
   }
+  // Continue finalize from auto-tapped state
+  state = payState;
   cost = reduced;
-  if (from === 'jumpstart' && player.hand.length < 1) {
-    return { ...state, pendingCast: null };
+  const playerAfterTap = state.players.find((p) => p.id === playerId);
+  if (!playerAfterTap) return fail();
+  if (from === 'jumpstart' && playerAfterTap.hand.length < 1) {
+    return fail();
   }
-  if (from === 'retrace' && !player.hand.some((c) => c.card.type_line.includes('Land'))) {
-    return { ...state, pendingCast: null };
+  if (
+    from === 'retrace' &&
+    !playerAfterTap.hand.some((c) => c.card.type_line.includes('Land'))
+  ) {
+    return fail();
   }
 
   // Substitute X into damage/etc. effects (amount === -1 sentinel)
@@ -1237,6 +1617,7 @@ function finalizeCast(
 
   const colored = cost.W + cost.U + cost.B + cost.R + cost.G + cost.C;
   const isZero =
+    from === 'cascade' ||
     manaStr === '{0}' ||
     (manaStr != null && cost.generic === 0 && colored === 0 && !cost.unpayable);
 
@@ -1261,24 +1642,33 @@ function finalizeCast(
     p.exile.push(ex);
   }
 
-  // Additional costs
+  // Additional costs — use player picks (Arena); fail closed if missing
+  const pickedSac = opts?.costSacrificeIds || [];
+  const pickedDisc = opts?.costDiscardIds || [];
   if (extraCosts.sacrificeCreature) {
-    const sac = p.battlefield.find((c) => isCreature(c));
-    if (!sac) return { ...state, pendingCast: null };
+    const sacId = pickedSac[0];
+    const sac = sacId
+      ? p.battlefield.find((c) => c.id === sacId && isCreature(c))
+      : undefined;
+    if (!sac) return fail();
     next = moveCard(next, sac.id, 'graveyard').state;
     const p2 = next.players.find((x) => x.id === playerId);
-    if (!p2) return { ...state, pendingCast: null };
+    if (!p2) return fail();
     p = p2;
   }
-  if (extraCosts.discard) {
-    let n = extraCosts.discard;
-    while (n > 0 && p.hand.length > 0) {
-      const hi = p.hand.findIndex((c) => c.id !== cardId);
-      if (hi < 0) break;
+  {
+    let discNeed = extraCosts.discard || 0;
+    if (from === 'jumpstart') discNeed += 1;
+    if (from === 'retrace') discNeed += 1;
+    const ids = [...pickedDisc];
+    if (ids.length < discNeed) return fail();
+    for (const id of ids.slice(0, discNeed)) {
+      if (id === cardId) return fail();
+      const hi = p.hand.findIndex((c) => c.id === id);
+      if (hi < 0) return fail();
+      if (from === 'retrace' && !p.hand[hi].card.type_line.includes('Land')) return fail();
       const [d] = p.hand.splice(hi, 1);
-      d.zone = 'graveyard';
-      p.graveyard.push(d);
-      n -= 1;
+      pushToGyOrExile(next, p, d);
     }
   }
   if (extraCosts.payLife) {
@@ -1287,36 +1677,29 @@ function finalizeCast(
   }
 
   if (!isZero) {
-    const paid = payManaDetailed(p.manaPool, cost, p.life);
-    if (!paid) return { ...state, pendingCast: null };
+    const hybrids = cost.hybrids || [];
+    const picks = opts?.hybridPicks;
+    if (hybrids.length > 0 && (!picks || picks.length !== hybrids.length)) {
+      return fail();
+    }
+    const paid = payManaDetailed(p.manaPool, cost, p.life, {
+      preferPhyrexianLife: !!opts?.preferPhyrexianLife,
+      hybridPicks: picks,
+    });
+    if (!paid) return fail();
     p.manaPool = paid.pool;
     if (paid.lifePaid > 0) {
       p.life -= paid.lifePaid;
       p.lostLifeThisTurn = true;
     }
   }
-
-  if (from === 'jumpstart') {
-    if (p.hand.length < 1) return { ...state, pendingCast: null };
-    const [disc] = p.hand.splice(0, 1);
-    disc.zone = 'graveyard';
-    p.graveyard.push(disc);
-  }
-  if (from === 'retrace') {
-    const li = p.hand.findIndex((c) => c.card.type_line.includes('Land'));
-    if (li < 0) return { ...state, pendingCast: null };
-    const [land] = p.hand.splice(li, 1);
-    land.zone = 'graveyard';
-    p.graveyard.push(land);
-  }
   if (from === 'escape') {
     const esc = parseEscape(card.card.oracle_text);
     if (!esc) return { ...state, pendingCast: null };
-    const others = p.graveyard.filter((c) => c.id !== cardId);
-    if (others.length < esc.exile) return { ...state, pendingCast: null };
-    for (let i = 0; i < esc.exile; i++) {
-      const c = others[i];
-      const gi = p.graveyard.findIndex((x) => x.id === c.id);
+    const picked = (escapeExiled || []).filter((id) => id !== cardId);
+    if (picked.length < esc.exile) return { ...state, pendingCast: null };
+    for (const id of picked.slice(0, esc.exile)) {
+      const gi = p.graveyard.findIndex((x) => x.id === id);
       if (gi < 0) continue;
       const [ex] = p.graveyard.splice(gi, 1);
       ex.zone = 'exile';
@@ -1326,7 +1709,7 @@ function finalizeCast(
 
   const fromGy =
     from === 'flashback' || from === 'jumpstart' || from === 'escape' || from === 'retrace';
-  // evoke/overload from hand
+  // evoke/overload/cascade from hand
   const zoneList = from === 'command' ? p.commandZone : fromGy ? p.graveyard : p.hand;
   const idx = zoneList.findIndex((c) => c.id === cardId);
   if (idx === -1) return { ...state, pendingCast: null };
@@ -1509,6 +1892,27 @@ export function resolveSpellEffects(state: GameState): GameState {
           const loy = parseInt(inst.card.loyalty, 10);
           if (Number.isFinite(loy)) inst.counters['loyalty'] = loy;
         }
+        // Battle — defense counters + Siege protector (310 / 310.12a)
+        if (isBattle(inst)) {
+          const def = parseDefense(inst.card);
+          if (def != null) inst.counters['defense'] = def;
+          const opps = next.players.filter(
+            (p) => !p.hasLost && p.id !== top.controller,
+          );
+          if (opps.length === 1) {
+            inst.protectorPlayerId = opps[0].id;
+          } else if (opps.length > 1 && (isSiege(inst) || isBattle(inst))) {
+            next.pendingChoices = [
+              ...next.pendingChoices,
+              {
+                type: 'chooseBattleProtector',
+                playerId: top.controller,
+                battleId: inst.id,
+                opponentIds: opps.map((p) => p.id),
+              },
+            ];
+          }
+        }
         const modN = parseModular(inst.card.oracle_text);
         if (modN !== null) {
           inst.counters['+1/+1'] = (inst.counters['+1/+1'] || 0) + modN;
@@ -1539,27 +1943,22 @@ export function resolveSpellEffects(state: GameState): GameState {
           }
         }
 
-        // Devour N (702.81) — MVP: sac all other creatures you control
+        // Devour N (702.81) — choose any number of other creatures to sac
         const devourN = parseDevour(inst.card.oracle_text, inst.card.keywords);
         if (devourN != null && devourN > 0) {
           const others = owner.battlefield.filter(
             (c) => c.id !== inst.id && isCreature(c),
           );
-          let eaten = 0;
-          for (const o of others) {
-            next = moveCard(next, o.id, 'graveyard').state;
-            eaten += 1;
-          }
-          if (eaten > 0) {
-            const f = findCard(next, inst.id);
-            const perm =
-              f?.zone === 'battlefield'
-                ? f.player.battlefield.find((c) => c.id === inst.id)
-                : undefined;
-            if (perm) {
-              perm.counters['+1/+1'] =
-                (perm.counters['+1/+1'] || 0) + eaten * devourN;
-            }
+          if (others.length > 0) {
+            next.pendingChoices = [
+              ...next.pendingChoices,
+              {
+                type: 'devour',
+                playerId: top.controller,
+                permanentId: inst.id,
+                devourN,
+              },
+            ];
           }
         }
 
@@ -1569,7 +1968,18 @@ export function resolveSpellEffects(state: GameState): GameState {
           next = resolveSagaChapter(next, top.controller, inst.id, 1);
         }
 
+        // Class (717) — enters at level 1
+        if (isClass(inst.card)) {
+          inst.classLevel = 1;
+        }
+
         next = fireEtbTriggers(next, top.controller, inst);
+
+        // Daybound (702.145b/d) — night → transform; neither → become day
+        if (hasDaybound(inst.card)) {
+          const { applyDayboundEtbFace } = require('./dayNight') as typeof import('./dayNight');
+          next = applyDayboundEtbFace(next, inst.id);
+        }
 
         // Backup N (702.164) — put N +1/+1 on another creature
         const bak = parseBackup(inst.card.oracle_text, inst.card.keywords);
@@ -1681,3 +2091,228 @@ export function resolveSpellEffects(state: GameState): GameState {
 }
 
 registerStackResolver(resolveSpellEffects);
+
+export type HandCastOptionId =
+  | 'hand'
+  | 'evoke'
+  | 'spectacle'
+  | 'dash'
+  | 'blitz'
+  | 'overload'
+  | 'cycle';
+
+export type HandCastOption = {
+  id: HandCastOptionId;
+  label: string;
+  hint?: string;
+};
+
+/** Probe legal cast / alt-cost / cycle choices for a hand card (Arena modal). */
+export function listHandCastOptions(
+  state: GameState,
+  playerId: string,
+  cardId: string,
+): HandCastOption[] {
+  const player = state.players.find((p) => p.id === playerId);
+  const card = player?.hand.find((c) => c.id === cardId);
+  if (!card) return [];
+  const oracle = card.card.oracle_text;
+  const probes: { id: HandCastOptionId; label: string; hint?: string; run: () => GameState }[] = [
+    {
+      id: 'hand',
+      label: 'Cast',
+      hint: card.card.mana_cost || undefined,
+      run: () => beginCast(state, playerId, cardId),
+    },
+    {
+      id: 'evoke',
+      label: 'Evoke',
+      hint: parseEvokeCost(oracle) || undefined,
+      run: () => beginCastEvoke(state, playerId, cardId),
+    },
+    {
+      id: 'spectacle',
+      label: 'Spectacle',
+      hint: parseSpectacleCost(oracle) || undefined,
+      run: () => beginCastSpectacle(state, playerId, cardId),
+    },
+    {
+      id: 'dash',
+      label: 'Dash',
+      hint: parseDashCost(oracle) || undefined,
+      run: () => beginCastDash(state, playerId, cardId),
+    },
+    {
+      id: 'blitz',
+      label: 'Blitz',
+      hint: parseBlitzCost(oracle) || undefined,
+      run: () => beginCastBlitz(state, playerId, cardId),
+    },
+    {
+      id: 'overload',
+      label: 'Overload',
+      hint: parseOverloadCost(oracle) || undefined,
+      run: () => beginCastOverload(state, playerId, cardId),
+    },
+    {
+      id: 'cycle',
+      label: 'Cycle',
+      hint: (() => {
+        const n = parseCyclingCost(oracle);
+        return n != null ? `{${n}}` : undefined;
+      })(),
+      run: () => beginCycle(state, playerId, cardId),
+    },
+  ];
+  return probes
+    .filter((p) => p.run() !== state)
+    .map(({ id, label, hint }) => ({ id, label, hint }));
+}
+
+export function applyHandCastOption(
+  state: GameState,
+  playerId: string,
+  cardId: string,
+  optionId: HandCastOptionId,
+): GameState {
+  switch (optionId) {
+    case 'hand':
+      return beginCast(state, playerId, cardId);
+    case 'evoke':
+      return beginCastEvoke(state, playerId, cardId);
+    case 'spectacle':
+      return beginCastSpectacle(state, playerId, cardId);
+    case 'dash':
+      return beginCastDash(state, playerId, cardId);
+    case 'blitz':
+      return beginCastBlitz(state, playerId, cardId);
+    case 'overload':
+      return beginCastOverload(state, playerId, cardId);
+    case 'cycle':
+      return beginCycle(state, playerId, cardId);
+    default:
+      return state;
+  }
+}
+
+/** Rough pending-cast mana cost (for auto-tap UX / label). */
+export function pendingSpellManaCost(state: GameState): ManaCost | null {
+  const pending = state.pendingCast;
+  if (!pending) return null;
+  if (
+    pending.from === 'ability' ||
+    pending.from === 'equip' ||
+    pending.from === 'crew' ||
+    pending.from === 'trigger'
+  ) {
+    return null;
+  }
+  const card = findCastable(state, pending.playerId, pending.cardId, pending.from as CastFrom);
+  if (!card) return null;
+  let cost = spellCost(card, pending.from as CastFrom, pending.xValue || 0);
+  cost = applyGenericDiscount(
+    cost,
+    affinityDiscount(state, pending.playerId, card.card) +
+      selfCostReduction(card.card.oracle_text),
+  );
+  const player = state.players.find((p) => p.id === pending.playerId);
+  const convokeCreatures = (pending.convokeTapped || [])
+    .map((id) => player?.battlefield.find((c) => c.id === id))
+    .filter((c): c is CardInstance => !!c);
+  const delveN =
+    (pending.delveExiled?.length || 0) + (pending.improviseTapped?.length || 0);
+  return reduceCostWithConvokeDelve(cost, convokeCreatures, delveN);
+}
+
+/** Tap lands/rocks toward the pending spell’s cost (Arena Auto-tap). */
+export function autoTapForPendingCast(state: GameState): GameState {
+  const pending = state.pendingCast;
+  const cost = pendingSpellManaCost(state);
+  if (!pending || !cost) return state;
+  return autoTapManaForCost(state, pending.playerId, cost);
+}
+
+export type GraveCastOptionId =
+  | 'flashback'
+  | 'jumpstart'
+  | 'escape'
+  | 'retrace'
+  | 'embalm'
+  | 'unearth';
+
+export type GraveCastOption = {
+  id: GraveCastOptionId;
+  label: string;
+  hint?: string;
+};
+
+/** Probe legal GY cast options (Arena modal when multiple). */
+export function listGraveCastOptions(
+  state: GameState,
+  playerId: string,
+  cardId: string,
+): GraveCastOption[] {
+  const probes: { id: GraveCastOptionId; label: string; hint?: string; run: () => GameState }[] = [
+    {
+      id: 'flashback',
+      label: 'Flashback',
+      hint: (() => {
+        const c = state.players.find((p) => p.id === playerId)?.graveyard.find((x) => x.id === cardId);
+        return parseFlashbackCost(c?.card.oracle_text) || undefined;
+      })(),
+      run: () => beginCastFlashback(state, playerId, cardId),
+    },
+    {
+      id: 'jumpstart',
+      label: 'Jump-start',
+      run: () => beginCastJumpStart(state, playerId, cardId),
+    },
+    {
+      id: 'escape',
+      label: 'Escape',
+      run: () => beginCastEscape(state, playerId, cardId),
+    },
+    {
+      id: 'retrace',
+      label: 'Retrace',
+      run: () => beginCastRetrace(state, playerId, cardId),
+    },
+    {
+      id: 'embalm',
+      label: 'Embalm',
+      run: () => beginEmbalm(state, playerId, cardId),
+    },
+    {
+      id: 'unearth',
+      label: 'Unearth',
+      run: () => beginUnearth(state, playerId, cardId),
+    },
+  ];
+  return probes
+    .filter((p) => p.run() !== state)
+    .map(({ id, label, hint }) => ({ id, label, hint }));
+}
+
+export function applyGraveCastOption(
+  state: GameState,
+  playerId: string,
+  cardId: string,
+  optionId: GraveCastOptionId,
+): GameState {
+  switch (optionId) {
+    case 'flashback':
+      return beginCastFlashback(state, playerId, cardId);
+    case 'jumpstart':
+      return beginCastJumpStart(state, playerId, cardId);
+    case 'escape':
+      return beginCastEscape(state, playerId, cardId);
+    case 'retrace':
+      return beginCastRetrace(state, playerId, cardId);
+    case 'embalm':
+      return beginEmbalm(state, playerId, cardId);
+    case 'unearth':
+      return beginUnearth(state, playerId, cardId);
+    default:
+      return state;
+  }
+}

@@ -7,17 +7,33 @@ import { isValidStoredDeck } from '../../../lib/engine/fromDeck';
 import type { GameState, MaxSeats, RoomAction, SeatId } from '../../../lib/onlineTypes';
 import { ALL_SEATS } from '../../../lib/onlineTypes';
 import { loadPlayDeck } from '../../../lib/playSession';
+import { AltCastModal } from '../../../components/play/AltCastModal';
 import { ArenaTable } from '../../../components/play/ArenaTable';
+import { CombatPromptPanel } from '../../../components/play/CombatPromptPanel';
+import { MulliganBottom, MulliganDecide } from '../../../components/play/MulliganPanel';
 import {
+  canPayMana,
+  formatManaCost,
   isCombatDeclaring,
   legalAttackers,
   legalBlockers,
+  listGraveCastOptions,
+  listHandCastOptions,
   listLegalTargets,
   parseLoyaltyAbilities,
   parseActivatedAbilities,
+  pendingSpellManaCost,
+  primaryPrompt,
+  getClock,
+  shouldAutoYield,
   type CardInstance,
+  type GraveCastOptionId,
+  type HandCastOptionId,
+  type ManaColor,
   type TargetRef,
+  type StopKey,
 } from '../../../lib/engine';
+import { ManaGems } from '../../../components/play/ManaGems';
 
 type Session = {
   roomId: string;
@@ -49,7 +65,13 @@ export default function OnlinePlayPage() {
   const [deckChoice, setDeckChoice] = useState<DeckChoice>('session');
   const [fileDeck, setFileDeck] = useState<StoredDeck | null>(null);
   const [sessionDeck, setSessionDeck] = useState<StoredDeck | null>(null);
-  const [maxSeats] = useState<MaxSeats>(2);
+  const [maxSeats, setMaxSeats] = useState<MaxSeats>(2);
+  const [altCast, setAltCast] = useState<{
+    cardId: string;
+    cardName: string;
+    options: { id: string; label: string; hint?: string }[];
+    zone: 'hand' | 'gy';
+  } | null>(null);
 
   useEffect(() => {
     setSessionDeck(loadPlayDeck());
@@ -207,6 +229,44 @@ export default function OnlinePlayPage() {
   const state = view?.state ?? null;
   const myPriority = state?.players[state.priorityPlayerIndex]?.id === session?.seat;
 
+  // Arena auto-yield for your seat (stops / Full Control / pass-turn)
+  const myClock = state && session ? getClock(state, session.seat) : null;
+  useEffect(() => {
+    if (!session || !state || !myPriority) return;
+    if (!shouldAutoYield(state, session.seat)) return;
+    const t = window.setTimeout(() => {
+      void send({ type: 'pass' });
+    }, 320);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    session?.seat,
+    myPriority,
+    state?.turnNumber,
+    state?.phase,
+    state?.step,
+    state?.priorityPlayerIndex,
+    state?.stack.length,
+    state?.combat?.mode,
+    view?.version,
+    myClock?.fullControl,
+    myClock?.holdPriorityOnce,
+    myClock?.passTurnMode,
+    myClock?.stops.join(','),
+  ]);
+
+  // Pass-turn "until response" cancels when opponent puts something on the stack
+  useEffect(() => {
+    if (!session || !state) return;
+    const clock = getClock(state, session.seat);
+    if (clock.passTurnMode !== 'untilResponse') return;
+    const top = state.stack[state.stack.length - 1];
+    if (top && top.controller !== session.seat) {
+      void send({ type: 'setPassTurnMode', mode: 'off' });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.seat, state?.stack.length, view?.version, myClock?.passTurnMode]);
+
   if (!session) {
     return (
       <div className="min-h-screen bg-zinc-950 text-zinc-100 p-6 max-w-lg mx-auto space-y-6">
@@ -283,6 +343,18 @@ export default function OnlinePlayPage() {
             )}
           </label>
         </fieldset>
+        <label className="block text-sm space-y-1">
+          <span className="text-zinc-400">Počet hráčů</span>
+          <select
+            value={maxSeats}
+            onChange={(e) => setMaxSeats(Number(e.target.value) as MaxSeats)}
+            className="w-full bg-zinc-900 border border-zinc-700 rounded px-3 py-2"
+          >
+            <option value={2}>2 hráči</option>
+            <option value={3}>3 hráči</option>
+            <option value={4}>4 hráči</option>
+          </select>
+        </label>
         <button
           type="button"
           disabled={busy}
@@ -416,10 +488,31 @@ export default function OnlinePlayPage() {
       return;
     }
     if (castingMine) {
-      void send({
-        type: 'selectCastTarget',
-        target: { kind: 'permanent', permanentId: card.id },
-      });
+      const pc = state.pendingCast!;
+      if (pc.phase === 'additionalCost') {
+        void send({ type: 'toggleCostSacrifice', permanentId: card.id });
+        return;
+      }
+      const special =
+        pc.phase === 'convoke' ||
+        pc.phase === 'improvise' ||
+        pc.phase === 'delve' ||
+        pc.phase === 'escapeExile';
+      const slot = pc.slots[pc.currentSlot];
+      const ok =
+        special ||
+        (slot &&
+          legal.some((t) => t.kind === 'permanent' && t.permanentId === card.id));
+      if (ok) {
+        void send({
+          type: 'selectCastTarget',
+          target: { kind: 'permanent', permanentId: card.id },
+        });
+        return;
+      }
+      if (playerId === session.seat) {
+        void send({ type: 'activateMana', cardId: card.id });
+      }
       return;
     }
     if (myPriority && playerId === session.seat) {
@@ -460,16 +553,92 @@ export default function OnlinePlayPage() {
         highlightStackIds={highlightStackIds}
         casting={castingMine || declaring}
         onPass={() => void send({ type: 'pass' })}
+        clockControls={{
+          onToggleStop: (key: StopKey) => void send({ type: 'toggleStop', key }),
+          onToggleFullControl: () => {
+            const on = !getClock(state, session.seat).fullControl;
+            void send({ type: 'setFullControl', on });
+          },
+          onArmHold: () => {
+            if (getClock(state, session.seat).holdPriorityOnce) {
+              void send({ type: 'clearHoldPriority' });
+            } else {
+              void send({ type: 'armHoldPriority' });
+            }
+          },
+          onPassTurn: (mode) => void send({ type: 'setPassTurnMode', mode }),
+          onPrimary: () => {
+            const prompt = primaryPrompt(state, session.seat);
+            if (
+              prompt.kind === 'casting' &&
+              state.pendingCast?.phase === 'additionalCost' &&
+              prompt.enabled
+            ) {
+              void send({ type: 'confirmAdditionalCost' });
+            } else if (
+              prompt.kind === 'casting' &&
+              state.pendingCast?.phase === 'pay' &&
+              prompt.enabled
+            ) {
+              void send({ type: 'confirmCastPay' });
+            } else if (prompt.kind === 'confirmAttackers') void send({ type: 'confirmAttackers' });
+            else if (prompt.kind === 'confirmBlockers') void send({ type: 'confirmBlockers' });
+            else if (prompt.kind === 'confirmDamage') void send({ type: 'confirmDamageAssign' });
+            else if (prompt.enabled) void send({ type: 'pass' });
+          },
+        }}
         onPlayerLifeClick={(pid) => {
           if (castingMine) {
             void send({ type: 'selectCastTarget', target: { kind: 'player', playerId: pid } });
           }
         }}
         onBattlefieldCard={onBattlefield}
+        onBlockerDropOnAttacker={(attackerId, blockerId) =>
+          void send({ type: 'dropBlockerOnAttacker', attackerId, blockerId })
+        }
+        onAttackerDropOnDefend={(attackerId, target) =>
+          void send({
+            type: 'setAttackerDefendTarget',
+            attackerId,
+            defendingPlayerId: target.playerId,
+            defendingPlaneswalkerId: target.planeswalkerId,
+            defendingBattleId: target.battleId,
+          })
+        }
         onHandCard={(c) => {
+          if (state.pendingCast?.phase === 'additionalCost' && castingMine) {
+            void send({ type: 'toggleCostDiscard', cardId: c.id });
+            return;
+          }
           if (!myPriority || state.pendingCast) return;
-          if (c.card.type_line.includes('Land')) void send({ type: 'playLand', cardId: c.id });
-          else void send({ type: 'beginCast', cardId: c.id });
+          if (c.card.type_line.includes('Land')) {
+            setAltCast(null);
+            void send({ type: 'playLand', cardId: c.id });
+            return;
+          }
+          const options = listHandCastOptions(state, session.seat, c.id);
+          if (options.length === 0) return;
+          if (options.length > 1) {
+            setAltCast({ cardId: c.id, cardName: c.card.name, options, zone: 'hand' });
+            return;
+          }
+          setAltCast(null);
+          const id = options[0].id as HandCastOptionId;
+          const type =
+            id === 'hand'
+              ? 'beginCast'
+              : id === 'cycle'
+                ? 'beginCycle'
+                : id === 'evoke'
+                  ? 'beginCastEvoke'
+                  : id === 'spectacle'
+                    ? 'beginCastSpectacle'
+                    : id === 'dash'
+                      ? 'beginCastDash'
+                      : id === 'blitz'
+                        ? 'beginCastBlitz'
+                        : 'beginCastOverload';
+          void send({ type, cardId: c.id });
         }}
         onCommandCard={(c) => {
           if (myPriority && !state.pendingCast) {
@@ -489,7 +658,33 @@ export default function OnlinePlayPage() {
                   target: { kind: 'permanent', permanentId: c.id },
                 })
             : myPriority && !state.pendingCast
-              ? (c) => void send({ type: 'beginCastFlashback', cardId: c.id })
+              ? (c) => {
+                  const options = listGraveCastOptions(state, session.seat, c.id);
+                  if (options.length === 0) return;
+                  if (options.length > 1) {
+                    setAltCast({
+                      cardId: c.id,
+                      cardName: c.card.name,
+                      options,
+                      zone: 'gy',
+                    });
+                    return;
+                  }
+                  const id = options[0].id as GraveCastOptionId;
+                  const type =
+                    id === 'flashback'
+                      ? 'beginCastFlashback'
+                      : id === 'jumpstart'
+                        ? 'beginCastJumpStart'
+                        : id === 'escape'
+                          ? 'beginCastEscape'
+                          : id === 'retrace'
+                            ? 'beginCastRetrace'
+                            : id === 'embalm'
+                              ? 'beginEmbalm'
+                              : 'beginUnearth';
+                  void send({ type, cardId: c.id });
+                }
               : undefined
         }
         promptSlot={
@@ -727,47 +922,113 @@ export default function OnlinePlayPage() {
                 </div>
               );
             }
-            if (choice.type === 'mulligan') {
-              const hand = state.players.find((p) => p.id === choice.playerId)?.hand || [];
+            if (choice.type === 'devour') {
+              const bf = (
+                state.players.find((p) => p.id === choice.playerId)?.battlefield || []
+              ).filter((c) => /creature/i.test(c.card.type_line) && c.id !== choice.permanentId);
               return (
                 <div key={i} className="space-y-1">
                   <div>
-                    Mulligan ({choice.mulligansTaken} · {choice.phase})
-                    {!mine && <span className="text-zinc-500"> (ceka souper)</span>}
+                    Devour {choice.devourN}
+                    {!mine && <span className="text-zinc-500"> (čeká soupeř)</span>}
                   </div>
-                  {mine && choice.phase === 'decide' && (
-                    <div className="flex gap-2">
-                      <button
-                        type="button"
-                        className="text-xs bg-amber-800 px-2 py-1 rounded"
-                        onClick={() => void send({ type: 'resolveMulliganKeep' })}
-                      >
-                        Keep
-                      </button>
-                      <button
-                        type="button"
-                        className="text-xs bg-zinc-700 px-2 py-1 rounded"
-                        onClick={() => void send({ type: 'resolveMulliganTake' })}
-                      >
-                        Mulligan
-                      </button>
-                    </div>
-                  )}
-                  {mine && choice.phase === 'bottom' && (
+                  {mine && (
                     <button
                       type="button"
                       className="text-xs bg-amber-800 px-2 py-1 rounded"
                       onClick={() =>
                         void send({
-                          type: 'resolveMulliganBottom',
-                          bottomIds: hand.slice(0, choice.mulligansTaken).map((c) => c.id),
+                          type: 'resolveDevour',
+                          creatureIds: bf.map((c) => c.id),
                         })
                       }
                     >
-                      Bottom first {choice.mulligansTaken}
+                      Sac all ({bf.length})
                     </button>
                   )}
                 </div>
+              );
+            }
+            if (choice.type === 'optionalEffect') {
+              return (
+                <div key={i} className="space-y-1">
+                  <div>
+                    You may {choice.label}?
+                    {!mine && <span className="text-zinc-500"> (čeká soupeř)</span>}
+                  </div>
+                  {mine && (
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        className="text-xs bg-amber-800 px-2 py-1 rounded"
+                        onClick={() => void send({ type: 'resolveOptionalEffect', take: true })}
+                      >
+                        Yes
+                      </button>
+                      <button
+                        type="button"
+                        className="text-xs bg-zinc-700 px-2 py-1 rounded"
+                        onClick={() => void send({ type: 'resolveOptionalEffect', take: false })}
+                      >
+                        No
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            }
+            if (choice.type === 'chooseBattleProtector') {
+              return (
+                <div key={i} className="space-y-1">
+                  <div>
+                    Choose battle protector
+                    {!mine && <span className="text-zinc-500"> (čeká soupeř)</span>}
+                  </div>
+                  {mine &&
+                    choice.opponentIds.map((oid) => (
+                      <button
+                        key={oid}
+                        type="button"
+                        className="text-xs bg-amber-800 px-2 py-1 rounded mr-1"
+                        onClick={() =>
+                          void send({ type: 'resolveBattleProtector', opponentId: oid })
+                        }
+                      >
+                        {state.players.find((p) => p.id === oid)?.name || oid}
+                      </button>
+                    ))}
+                </div>
+              );
+            }
+            if (choice.type === 'mulligan') {
+              const hand = state.players.find((p) => p.id === choice.playerId)?.hand || [];
+              if (!mine) {
+                return (
+                  <div key={i} className="text-sm text-zinc-400">
+                    Mulligan — čeká soupeř…
+                  </div>
+                );
+              }
+              if (choice.phase === 'decide') {
+                return (
+                  <MulliganDecide
+                    key={i}
+                    mulligansTaken={choice.mulligansTaken}
+                    hand={hand}
+                    onKeep={() => void send({ type: 'resolveMulliganKeep' })}
+                    onMulligan={() => void send({ type: 'resolveMulliganTake' })}
+                  />
+                );
+              }
+              return (
+                <MulliganBottom
+                  key={i}
+                  need={choice.mulligansTaken}
+                  hand={hand}
+                  onDone={(bottomIds) =>
+                    void send({ type: 'resolveMulliganBottom', bottomIds })
+                  }
+                />
               );
             }
             if (choice.type === 'orderTriggers') {
@@ -841,7 +1102,34 @@ export default function OnlinePlayPage() {
         state.combat.declaringPlayerId === session.seat && (
           <div className="p-3 bg-orange-950 border border-orange-700 rounded text-sm space-y-2">
             <div className="font-semibold text-orange-200">Declare attackers</div>
+            <div className="text-xs text-orange-100/80">
+              Click creatures · draft {state.combat.draftAttackerIds.length || 0} · confirm with
+              Pass
+            </div>
             <div className="flex flex-wrap gap-1 text-xs">
+              <span className="text-orange-300/80 self-center">Attack:</span>
+              {state.players
+                .filter(
+                  (p) => !p.hasLost && p.id !== state.players[state.activePlayerIndex]?.id,
+                )
+                .map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className={`px-2 py-0.5 rounded border ${
+                      state.combat?.draftDefendPlayerId === p.id &&
+                      !state.combat?.draftDefendPlaneswalkerId &&
+                      !state.combat?.draftDefendBattleId
+                        ? 'border-orange-400'
+                        : 'border-zinc-600'
+                    }`}
+                    onClick={() =>
+                      void send({ type: 'setDefendPlayer', defendingPlayerId: p.id })
+                    }
+                  >
+                    {p.name}
+                  </button>
+                ))}
               {(
                 state.players.find((p) => p.id === state.combat?.draftDefendPlayerId)
                   ?.battlefield || []
@@ -875,46 +1163,22 @@ export default function OnlinePlayPage() {
                 </button>
               )}
             </div>
-            <button
-              type="button"
-              className="bg-orange-700 px-3 py-1 rounded text-xs"
-              onClick={() => void send({ type: 'confirmAttackers' })}
-            >
-              Confirm attackers
-            </button>
           </div>
         )}
 
-      {state.combat?.mode === 'declareBlockers' &&
-        state.combat.declaringPlayerId === session.seat && (
-          <div className="p-3 bg-orange-950 border border-orange-700 rounded text-sm space-y-2">
-            <div className="font-semibold text-orange-200">Declare blockers</div>
-            <button
-              type="button"
-              className="bg-orange-700 px-3 py-1 rounded text-xs"
-              onClick={() => void send({ type: 'confirmBlockers' })}
-            >
-              Confirm blockers
-            </button>
-          </div>
-        )}
-
-      {state.combat?.mode === 'assignDamage' &&
-        state.players[state.activePlayerIndex]?.id === session.seat && (
-          <div className="p-3 bg-red-950 border border-red-800 rounded text-sm space-y-2">
-            <div className="font-semibold text-red-200">Assign combat damage</div>
-            <p className="text-xs text-red-100/70">
-              Prefill = lethal; Confirm applies (edit via setDamage API later / use solo for fine control).
-            </p>
-            <button
-              type="button"
-              className="bg-red-700 px-3 py-1 rounded text-xs"
-              onClick={() => void send({ type: 'confirmDamageAssign' })}
-            >
-              Confirm damage
-            </button>
-          </div>
-        )}
+      <CombatPromptPanel
+        state={state}
+        youId={session.seat}
+        primaryHandlesConfirm
+        onMoveBlocker={(attackerId, blockerId, direction) =>
+          void send({ type: 'moveDraftBlocker', attackerId, blockerId, direction })
+        }
+        onConfirmBlockers={() => void send({ type: 'confirmBlockers' })}
+        onSetDamage={(attackerId, target, amount) =>
+          void send({ type: 'setDamageAssignAmount', attackerId, target, amount })
+        }
+        onConfirmDamage={() => void send({ type: 'confirmDamageAssign' })}
+      />
 
       {state.pendingLoyalty && state.pendingLoyalty.playerId === session.seat && (
         <div className="p-3 bg-sky-950 border border-sky-800 rounded text-sm space-y-2">
@@ -1060,29 +1324,200 @@ export default function OnlinePlayPage() {
           )}
           {(state.pendingCast.phase === 'convoke' ||
             state.pendingCast.phase === 'improvise' ||
-            state.pendingCast.phase === 'delve') && (
+            state.pendingCast.phase === 'delve' ||
+            state.pendingCast.phase === 'escapeExile') && (
             <button
               type="button"
               className="text-xs bg-fuchsia-800 px-2 py-1 rounded"
-              onClick={() => void send({ type: 'confirmConvokeDelve' })}
+              onClick={() =>
+                void send({
+                  type:
+                    state.pendingCast?.phase === 'escapeExile'
+                      ? 'confirmEscapeExile'
+                      : 'confirmConvokeDelve',
+                })
+              }
             >
               Done {state.pendingCast.phase} (
               {state.pendingCast.phase === 'convoke'
                 ? state.pendingCast.convokeTapped?.length || 0
                 : state.pendingCast.phase === 'improvise'
                   ? state.pendingCast.improviseTapped?.length || 0
-                  : state.pendingCast.delveExiled?.length || 0}
+                  : state.pendingCast.phase === 'escapeExile'
+                    ? `${state.pendingCast.escapeExiled?.length || 0}/${state.pendingCast.escapeNeeded || 0}`
+                    : state.pendingCast.delveExiled?.length || 0}
               )
             </button>
           )}
           {(!state.pendingCast.phase || state.pendingCast.phase === 'targets') && (
             <span className="text-fuchsia-200/80 text-xs">Klikni target (life / creature)</span>
           )}
+          {state.pendingCast.phase === 'additionalCost' && (
+            <div className="space-y-1 text-xs">
+              <div className="font-semibold text-fuchsia-100">Additional cost</div>
+              {(state.pendingCast.costDiscardNeed || 0) > 0 && (
+                <div>
+                  Discard {state.pendingCast.costDiscardFilter === 'land' ? 'land' : 'card'} (
+                  {state.pendingCast.costDiscardIds?.length || 0}/
+                  {state.pendingCast.costDiscardNeed}) — click hand
+                </div>
+              )}
+              {(state.pendingCast.costSacrificeNeed || 0) > 0 && (
+                <div>
+                  Sacrifice ({state.pendingCast.costSacrificeIds?.length || 0}/
+                  {state.pendingCast.costSacrificeNeed}) — click creature
+                </div>
+              )}
+              <button
+                type="button"
+                className="play-cast-mana__btn play-cast-mana__btn--go"
+                disabled={
+                  (state.pendingCast.costDiscardIds?.length || 0) <
+                    (state.pendingCast.costDiscardNeed || 0) ||
+                  (state.pendingCast.costSacrificeIds?.length || 0) <
+                    (state.pendingCast.costSacrificeNeed || 0)
+                }
+                onClick={() => void send({ type: 'confirmAdditionalCost' })}
+              >
+                Confirm cost
+              </button>
+            </div>
+          )}
+          {(() => {
+            const cost = pendingSpellManaCost(state);
+            if (!cost || state.pendingCast?.phase === 'additionalCost') return null;
+            const me = state.players.find((p) => p.id === session.seat);
+            const hybrids = cost.hybrids || [];
+            const picks = state.pendingCast?.hybridPicks || [];
+            const hybridsReady =
+              hybrids.length === 0 ||
+              (picks.length === hybrids.length &&
+                hybrids.every((h, i) => picks[i] === h.a || picks[i] === h.b));
+            const can =
+              !!me &&
+              hybridsReady &&
+              canPayMana(me.manaPool, cost, me.life, {
+                hybridPicks: hybrids.length ? picks : undefined,
+                preferPhyrexianLife: !!state.pendingCast?.preferPhyrexianLife,
+              });
+            const phy = (cost.phyrexian || []).length > 0;
+            return (
+              <div className="play-cast-mana">
+                <span className="inline-flex items-center gap-1">
+                  Cost <ManaGems cost={cost} />
+                  <span className="opacity-50">({formatManaCost(cost)})</span>
+                </span>
+                <span className="inline-flex items-center gap-1">
+                  Pool <ManaGems pool={me?.manaPool} />
+                </span>
+                {hybrids.map((h, i) => (
+                  <span key={i} className="inline-flex items-center gap-0.5 text-xs">
+                    {h.a}/{h.b}
+                    <button
+                      type="button"
+                      className={`play-cast-mana__btn ${picks[i] === h.a ? 'play-cast-mana__btn--go' : ''}`}
+                      onClick={() =>
+                        void send({ type: 'setHybridPick', index: i, color: h.a as ManaColor })
+                      }
+                    >
+                      {h.a}
+                    </button>
+                    <button
+                      type="button"
+                      className={`play-cast-mana__btn ${picks[i] === h.b ? 'play-cast-mana__btn--go' : ''}`}
+                      onClick={() =>
+                        void send({ type: 'setHybridPick', index: i, color: h.b as ManaColor })
+                      }
+                    >
+                      {h.b}
+                    </button>
+                  </span>
+                ))}
+                <button
+                  type="button"
+                  className="play-cast-mana__btn"
+                  onClick={() => void send({ type: 'autoTapForPending' })}
+                >
+                  Auto-tap
+                </button>
+                {phy && (
+                  <button
+                    type="button"
+                    className={`play-cast-mana__btn ${
+                      state.pendingCast?.preferPhyrexianLife ? 'play-cast-mana__btn--go' : ''
+                    }`}
+                    onClick={() =>
+                      void send({
+                        type: 'setPreferPhyrexianLife',
+                        prefer: !state.pendingCast?.preferPhyrexianLife,
+                      })
+                    }
+                  >
+                    Phyrexian: {state.pendingCast?.preferPhyrexianLife ? 'life' : 'mana'}
+                  </button>
+                )}
+                {state.pendingCast?.phase === 'pay' && (
+                  <button
+                    type="button"
+                    className="play-cast-mana__btn play-cast-mana__btn--go"
+                    disabled={!can}
+                    onClick={() => void send({ type: 'confirmCastPay' })}
+                  >
+                    Pay &amp; Cast
+                  </button>
+                )}
+              </div>
+            );
+          })()}
         </div>
       )}
           </>
         }
       />
+      {altCast && (
+        <AltCastModal
+          cardName={altCast.cardName}
+          options={altCast.options}
+          onPick={(id) => {
+            const cardId = altCast.cardId;
+            const zone = altCast.zone;
+            setAltCast(null);
+            if (zone === 'gy') {
+              const gid = id as GraveCastOptionId;
+              const type =
+                gid === 'flashback'
+                  ? 'beginCastFlashback'
+                  : gid === 'jumpstart'
+                    ? 'beginCastJumpStart'
+                    : gid === 'escape'
+                      ? 'beginCastEscape'
+                      : gid === 'retrace'
+                        ? 'beginCastRetrace'
+                        : gid === 'embalm'
+                          ? 'beginEmbalm'
+                          : 'beginUnearth';
+              void send({ type, cardId });
+              return;
+            }
+            const type =
+              id === 'hand'
+                ? 'beginCast'
+                : id === 'cycle'
+                  ? 'beginCycle'
+                  : id === 'evoke'
+                    ? 'beginCastEvoke'
+                    : id === 'spectacle'
+                      ? 'beginCastSpectacle'
+                      : id === 'dash'
+                        ? 'beginCastDash'
+                        : id === 'blitz'
+                          ? 'beginCastBlitz'
+                          : 'beginCastOverload';
+            void send({ type, cardId });
+          }}
+          onCancel={() => setAltCast(null)}
+        />
+      )}
     </>
   );
 }

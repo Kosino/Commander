@@ -10,9 +10,10 @@ import {
   ManaColor,
 } from './types';
 import { TargetRef } from './effects';
-import { clonePlayers, findCard } from './zones';
+import { clonePlayers, findCard, graveyardBecomesExile } from './zones';
 
 export type { PreventionShield, RedirectShield };
+export { graveyardBecomesExile };
 
 let _shieldSeq = 0;
 export function nextShieldId(): string {
@@ -49,24 +50,6 @@ export function addRedirectShield(
     { ...shield, id: shield.id || nextRedirectId() },
   ];
   return next;
-}
-
-/** Rest in Peace / Leyline of the Void style continuous replacement. */
-export function graveyardBecomesExile(state: GameState): boolean {
-  for (const p of state.players) {
-    for (const perm of p.battlefield) {
-      const t = perm.card.oracle_text || '';
-      if (
-        /if a card would be put into (?:a |any )?graveyard(?: from anywhere)?,?\s*exile (?:it|them) instead/i.test(
-          t,
-        ) ||
-        /if a card or token would be put into a graveyard from anywhere,?\s*exile it instead/i.test(t)
-      ) {
-        return true;
-      }
-    }
-  }
-  return false;
 }
 
 /** True if permanent should exile instead of going to GY (replacement). */

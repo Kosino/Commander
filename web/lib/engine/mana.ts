@@ -117,9 +117,20 @@ export function withExtraGeneric(cost: ManaCost, extra: number): ManaCost {
 function tryPayHybrid(
   avail: Record<ManaColor, number>,
   hybrids: HybridSymbol[],
+  picks?: ManaColor[],
 ): Record<ManaColor, number> | null {
-  // Greedy: for each hybrid, prefer the color with more available
   const pool = { ...avail };
+  if (picks && picks.length === hybrids.length) {
+    for (let i = 0; i < hybrids.length; i++) {
+      const h = hybrids[i];
+      const pick = picks[i];
+      if (pick !== h.a && pick !== h.b) return null;
+      if ((pool[pick] || 0) < 1) return null;
+      pool[pick] -= 1;
+    }
+    return pool;
+  }
+  // Greedy fallback (AI / unset picks): prefer the color with more available
   for (const h of hybrids) {
     if (pool[h.a] >= pool[h.b] && pool[h.a] > 0) pool[h.a] -= 1;
     else if (pool[h.b] > 0) pool[h.b] -= 1;
@@ -141,6 +152,7 @@ export function canPayMana(
   pool: Player['manaPool'],
   cost: ManaCost,
   life = 40,
+  opts?: { hybridPicks?: ManaColor[]; preferPhyrexianLife?: boolean },
 ): boolean {
   const c = norm(cost);
   if (
@@ -152,6 +164,15 @@ export function canPayMana(
   ) {
     return false;
   }
+  // Hybrid gem-by-gem: if picks provided, every hybrid must be chosen
+  if (c.hybrids.length > 0 && opts?.hybridPicks !== undefined) {
+    if (
+      opts.hybridPicks.length !== c.hybrids.length ||
+      opts.hybridPicks.some((p, i) => p !== c.hybrids[i].a && p !== c.hybrids[i].b)
+    ) {
+      return false;
+    }
+  }
   const avail = { ...pool };
   for (const col of COLORS) {
     if ((avail[col] || 0) < c[col]) return false;
@@ -159,11 +180,12 @@ export function canPayMana(
   }
   let lifeLeft = life;
   for (const col of c.phyrexian) {
-    if (avail[col] > 0) avail[col] -= 1;
+    if (opts?.preferPhyrexianLife && lifeLeft >= 2) lifeLeft -= 2;
+    else if (avail[col] > 0) avail[col] -= 1;
     else if (lifeLeft >= 2) lifeLeft -= 2;
     else return false;
   }
-  const afterHybrid = tryPayHybrid(avail, c.hybrids);
+  const afterHybrid = tryPayHybrid(avail, c.hybrids, opts?.hybridPicks);
   if (!afterHybrid) return false;
   let genericNeed = c.generic;
   const order: ManaColor[] = ['C', 'W', 'U', 'B', 'R', 'G'];
@@ -190,19 +212,30 @@ export function payManaDetailed(
   pool: Player['manaPool'],
   cost: ManaCost,
   life = 40,
+  opts?: { preferPhyrexianLife?: boolean; hybridPicks?: ManaColor[] },
 ): { pool: Player['manaPool']; lifePaid: number } | null {
   const c = norm(cost);
-  if (!canPayMana(pool, c, life)) return null;
+  if (!canPayMana(pool, c, life, opts)) return null;
   const avail = { ...pool };
   for (const col of COLORS) {
     avail[col] -= c[col];
   }
   let lifePaid = 0;
+  let lifeLeft = life;
   for (const col of c.phyrexian) {
-    if (avail[col] > 0) avail[col] -= 1;
-    else lifePaid += 2;
+    if (opts?.preferPhyrexianLife && lifeLeft >= 2) {
+      lifePaid += 2;
+      lifeLeft -= 2;
+    } else if (avail[col] > 0) {
+      avail[col] -= 1;
+    } else if (lifeLeft >= 2) {
+      lifePaid += 2;
+      lifeLeft -= 2;
+    } else {
+      return null;
+    }
   }
-  const afterHybrid = tryPayHybrid(avail, c.hybrids);
+  const afterHybrid = tryPayHybrid(avail, c.hybrids, opts?.hybridPicks);
   if (!afterHybrid) return null;
   let genericNeed = c.generic;
   const order: ManaColor[] = ['C', 'W', 'U', 'B', 'R', 'G'];
@@ -216,6 +249,19 @@ export function payManaDetailed(
 }
 
 /** Mana color produced by a basic land type line. */
+/** Display mana cost as `{2}{W}{U}`-style string. */
+export function formatManaCost(cost: ManaCost): string {
+  const parts: string[] = [];
+  if (cost.generic > 0) parts.push(`{${cost.generic}}`);
+  for (const c of COLORS) {
+    for (let i = 0; i < (cost[c] || 0); i++) parts.push(`{${c}}`);
+  }
+  for (const h of cost.hybrids || []) parts.push(`{${h.a}/${h.b}}`);
+  for (const p of cost.phyrexian || []) parts.push(`{${p}/P}`);
+  if (cost.unpayable) return '—';
+  return parts.join('') || '{0}';
+}
+
 export function basicLandMana(typeLine: string): ManaColor | null {
   if (typeLine.includes('Plains')) return 'W';
   if (typeLine.includes('Island')) return 'U';

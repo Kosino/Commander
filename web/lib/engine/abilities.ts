@@ -1,7 +1,10 @@
 /**
  * Activated abilities — `{T}: …`, Equip, loyalty, Clue/Food (Arena-like).
  */
+import { tryClassLevelUp, parseSolvedActivated } from './classCase';
 import {
+  isCase,
+  isClass,
   parseActivatedAbilities,
   parseAdapt,
   parseCrewCost,
@@ -114,6 +117,49 @@ export function beginActivate(
   if (/map/i.test(perm.card.type_line)) {
     const map = activateMap(state, playerId, permanentId);
     if (map !== state) return map;
+  }
+
+  // Class level-up (717.2a)
+  if (isClass(perm.card)) {
+    const leveled = tryClassLevelUp(state, playerId, permanentId);
+    if (leveled !== state) return leveled;
+  }
+
+  // Case Solved activated abilities (720 / 702.169d)
+  if (isCase(perm.card) && perm.solved) {
+    const solvedAbs = parseSolvedActivated(perm.card.oracle_text);
+    const legalSolved: number[] = [];
+    for (let i = 0; i < solvedAbs.length; i++) {
+      const ab = solvedAbs[i];
+      if (ab.needsTap && perm.tapped) continue;
+      if (ab.manaCost) {
+        const cost = parseManaCost(ab.manaCost);
+        if (!canPayMana(found.player.manaPool, cost, found.player.life)) continue;
+      }
+      legalSolved.push(i);
+    }
+    if (legalSolved.length === 1) {
+      const ab = solvedAbs[legalSolved[0]];
+      let next: GameState = state;
+      if (ab.manaCost) {
+        const cost = parseManaCost(ab.manaCost);
+        const n = clonePlayers(next);
+        const p = n.players.find((x) => x.id === playerId);
+        if (!p) return state;
+        const paid = payMana(p.manaPool, cost, p.life);
+        if (!paid) return state;
+        p.manaPool = paid;
+        next = n;
+      }
+      return startAbilityPending(
+        next,
+        playerId,
+        permanentId,
+        ab.script,
+        ab.costLabel,
+        ab.needsTap,
+      );
+    }
   }
 
   // Activated abilities: {T}: / {N}: / {T}, {N}:

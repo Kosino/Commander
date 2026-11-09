@@ -3,16 +3,20 @@ import { applyEffects } from './resolveEffects';
 import {
   GameState,
   hasKeyword,
+  isBattle,
   isCreature,
   isLegendary,
   isPlaneswalker,
+  isSiege,
   parseLoyalty,
+  parseDefense,
   effectiveToughness,
   PendingChoice,
 } from './types';
 import { deathDestination } from './replacement';
-import { fireDiesFromSnapshot } from './triggers';
+import { fireDiesFromSnapshot, fireEtbTriggers, queueTrigger } from './triggers';
 import { clonePlayers, findCard, moveCard } from './zones';
+import { makeInstance } from './setup';
 
 function losePlayer(state: GameState, playerId: string, reason: string): GameState {
   const next = clonePlayers(state);
@@ -149,6 +153,32 @@ export function applyStateBasedActionsOnce(state: GameState): { state: GameState
         const loy = perm.counters['loyalty'] ?? parseLoyalty(perm.card) ?? 0;
         if (loy <= 0) toGraveyard.push(perm.id); // 704.5i
       }
+      // 704.5v — Battle with 0 defense
+      if (isBattle(perm)) {
+        const def = perm.counters['defense'] ?? parseDefense(perm.card) ?? 0;
+        if (def <= 0) {
+          // Siege with back face: exile → cast transformed (310.12b MVP: put BF)
+          if (isSiege(perm) && perm.card.other_face && !perm.transformed) {
+            const ctrl = perm.controller;
+            const back = perm.card.other_face;
+            next = moveCard(next, perm.id, 'exile').state;
+            const owner = next.players.find((p) => p.id === ctrl);
+            if (owner) {
+              const transformed = makeInstance(back, ctrl, 'battlefield');
+              transformed.transformed = true;
+              if (back.loyalty) {
+                const loy = parseInt(back.loyalty, 10);
+                if (Number.isFinite(loy)) transformed.counters['loyalty'] = loy;
+              }
+              owner.battlefield.push(transformed);
+              next = fireEtbTriggers(next, ctrl, transformed);
+            }
+            performed = true;
+            continue;
+          }
+          toGraveyard.push(perm.id);
+        }
+      }
     }
   }
 
@@ -156,6 +186,7 @@ export function applyStateBasedActionsOnce(state: GameState): { state: GameState
     controllerId: string;
     oracle?: string;
     cardId: string;
+    name?: string;
     counters: Record<string, number>;
     keywords: string[];
     oracleText?: string;
@@ -170,6 +201,7 @@ export function applyStateBasedActionsOnce(state: GameState): { state: GameState
         controllerId: found.card.controller,
         oracle: found.card.card.oracle_text,
         cardId: found.card.id,
+        name: found.card.card.name,
         counters: { ...found.card.counters },
         keywords: found.card.card.keywords || [],
         oracleText: found.card.card.oracle_text,
@@ -210,11 +242,16 @@ export function applyStateBasedActionsOnce(state: GameState): { state: GameState
         wasCreature: d.wasCreature,
       })),
     );
-    // Afterlife / Modular / Blitz draw
+    // Afterlife (trigger) / Modular / Blitz draw
     for (const d of diedSnap) {
       const al = getAfterlife({ oracle_text: d.oracleText, keywords: d.keywords });
       if (al > 0) {
-        next = applyEffects(next, d.controllerId, [{ type: 'afterlife', count: al }], {});
+        next = queueTrigger(next, {
+          controllerId: d.controllerId,
+          name: `${d.name || 'Creature'} afterlife`,
+          sourcePermanentId: d.cardId,
+          script: { targets: [], effects: [{ type: 'afterlife', count: al }] },
+        });
       }
       const mod = parseModular(d.oracleText);
       if (mod !== null) {
@@ -536,6 +573,98 @@ export function resolveLookAtTopChoice(state: GameState): GameState {
   if (!choice || choice.type !== 'lookAtTop') return state;
   const next = clonePlayers(state);
   next.pendingChoices = next.pendingChoices.filter((c) => c !== choice);
+  return checkStateBasedActions(next);
+}
+
+/** Devour — sac chosen other creatures; get devourN +1/+1 each (702.81). */
+export function resolveDevourChoice(state: GameState, creatureIds: string[]): GameState {
+  const choice = state.pendingChoices.find((c) => c.type === 'devour');
+  if (!choice || choice.type !== 'devour') return state;
+  let next = clonePlayers(state);
+  next.pendingChoices = next.pendingChoices.filter((c) => c !== choice);
+  const p = next.players.find((x) => x.id === choice.playerId);
+  if (!p) return checkStateBasedActions(next);
+  let eaten = 0;
+  for (const id of creatureIds) {
+    if (id === choice.permanentId) continue;
+    const found = findCard(next, id);
+    if (!found || found.zone !== 'battlefield' || found.player.id !== choice.playerId) continue;
+    if (!isCreature(found.card)) continue;
+    next = moveCard(next, id, 'graveyard').state;
+    eaten += 1;
+  }
+  if (eaten > 0) {
+    const f = findCard(next, choice.permanentId);
+    const perm =
+      f?.zone === 'battlefield'
+        ? f.player.battlefield.find((c) => c.id === choice.permanentId)
+        : undefined;
+    if (perm) {
+      perm.counters['+1/+1'] = (perm.counters['+1/+1'] || 0) + eaten * choice.devourN;
+    }
+  }
+  return checkStateBasedActions(next);
+}
+
+/** Siege ETB — set protector (310.12a). */
+export function resolveBattleProtector(state: GameState, opponentId: string): GameState {
+  const choice = state.pendingChoices.find((c) => c.type === 'chooseBattleProtector');
+  if (!choice || choice.type !== 'chooseBattleProtector') return state;
+  if (!choice.opponentIds.includes(opponentId)) return state;
+  const next = clonePlayers(state);
+  next.pendingChoices = next.pendingChoices.filter((c) => c !== choice);
+  const found = findCard(next, choice.battleId);
+  if (found?.zone === 'battlefield') {
+    const battle = found.player.battlefield.find((c) => c.id === choice.battleId);
+    if (battle) battle.protectorPlayerId = opponentId;
+  }
+  return checkStateBasedActions(next);
+}
+
+/** Flip a DFC / transform permanent in place (701.27). */
+export function transformPermanent(state: GameState, permanentId: string): GameState {
+  const next = clonePlayers(state);
+  const found = findCard(next, permanentId);
+  if (!found || found.zone !== 'battlefield') return state;
+  const perm = found.player.battlefield.find((c) => c.id === permanentId);
+  if (!perm?.card.other_face) return state;
+  const back = perm.card.other_face;
+  const front = { ...perm.card, other_face: undefined };
+  // Swap: current becomes other_face of new face
+  perm.card = { ...back, other_face: front };
+  perm.transformed = !perm.transformed;
+  perm.damageMarked = 0;
+  perm.tempPower = 0;
+  perm.tempToughness = 0;
+  perm.tempKeywords = [];
+  // Re-init loyalty/defense for new face
+  if (back.loyalty) {
+    const loy = parseInt(back.loyalty, 10);
+    if (Number.isFinite(loy)) perm.counters['loyalty'] = loy;
+  }
+  if (back.defense) {
+    const def = parseInt(back.defense, 10);
+    if (Number.isFinite(def)) perm.counters['defense'] = def;
+  }
+  return checkStateBasedActions(next);
+}
+
+/** Optional "You may …" — take or decline. */
+export function resolveOptionalEffect(state: GameState, take: boolean): GameState {
+  const choice = state.pendingChoices.find((c) => c.type === 'optionalEffect');
+  if (!choice || choice.type !== 'optionalEffect') return state;
+  let next = clonePlayers(state);
+  next.pendingChoices = next.pendingChoices.filter((c) => c !== choice);
+  if (take) {
+    next = applyEffects(
+      next,
+      choice.playerId,
+      choice.script.effects,
+      {},
+      undefined,
+      choice.sourcePermanentId,
+    );
+  }
   return checkStateBasedActions(next);
 }
 

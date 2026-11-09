@@ -3,7 +3,7 @@
 
 import type { SpellScript, TargetRef, TargetSlot } from './effects';
 // SpellScript used by WaitingTrigger / DelayedTrigger
-import { continuousPtBonus, hasKeywordState } from './continuous';
+import { continuousPtBonus, continuousSetPt, hasKeywordState } from './continuous';
 
 export type ManaColor = 'W' | 'U' | 'B' | 'R' | 'G' | 'C';
 
@@ -25,11 +25,15 @@ export interface CardData {
   power?: string;
   toughness?: string;
   loyalty?: string;
+  /** Starting defense (Battles — CR 310). */
+  defense?: string;
   colors: ManaColor[];
   color_identity: ManaColor[];
   keywords: string[];
   /** Optional Scryfall art URL (or named-image endpoint). */
   image_uri?: string;
+  /** Back face for DFC / Siege (712 / 310.12b). */
+  other_face?: CardData;
 }
 
 export interface CardInstance {
@@ -93,6 +97,14 @@ export interface CardInstance {
   /** Base power while crewed (from card when Vehicle). */
   vehiclePower?: string;
   vehicleToughness?: string;
+  /** Battle protector (310.12a) — opponent who can block attacks on this battle. */
+  protectorPlayerId?: string;
+  /** DFC currently showing back face (701.27). */
+  transformed?: boolean;
+  /** Class level designation (717) — defaults to 1 while a Class. */
+  classLevel?: number;
+  /** Case solved designation (720.3b). */
+  solved?: boolean;
 }
 
 export interface Player {
@@ -119,6 +131,8 @@ export interface Player {
   attackedThisTurn: boolean;
   /** Life lost this turn (spectacle / etc.). */
   lostLifeThisTurn: boolean;
+  /** Life gained this turn (Case / morbid-adjacent conditions). */
+  gainedLifeThisTurn?: boolean;
   /** Pending extra turns (CR 500.7) — taken before opponent. */
   extraTurns?: number;
   /** London mulligans taken this game (bottom N after keep). */
@@ -201,6 +215,7 @@ export type PendingCast = {
     | 'embalm'
     | 'evoke'
     | 'overload'
+    | 'cascade'
     | 'ability'
     | 'equip'
     | 'crew'
@@ -230,7 +245,24 @@ export type PendingCast = {
     | 'convoke'
     | 'improvise'
     | 'delve'
-    | 'targets';
+    | 'escapeExile'
+    | 'targets'
+    | 'additionalCost'
+    | 'pay';
+  /** Prefer 2 life over colored mana for Phyrexian symbols (Arena toggle). */
+  preferPhyrexianLife?: boolean;
+  /** Per-hybrid symbol color pick (parallel to cost.hybrids). */
+  hybridPicks?: ManaColor[];
+  /**
+   * Additional cost picks (jump-start / retrace / discard / sacrifice).
+   * Filled in `additionalCost` phase before `pay`.
+   */
+  costDiscardNeed?: number;
+  /** 'land' = retrace; otherwise any non-spell card from hand. */
+  costDiscardFilter?: 'any' | 'land';
+  costDiscardIds?: string[];
+  costSacrificeNeed?: number;
+  costSacrificeIds?: string[];
   /** Chosen mode index when script.modes set. */
   modeIndex?: number;
   /** Announced X value. */
@@ -247,6 +279,10 @@ export type PendingCast = {
   convokeTapped?: string[];
   /** Delve: exiled GY card ids toward generic. */
   delveExiled?: string[];
+  /** Escape: other GY cards chosen to exile as additional cost. */
+  escapeExiled?: string[];
+  /** Escape — how many other cards must be exiled. */
+  escapeNeeded?: number;
   /** Pending trigger awaiting targets before stack. */
   pendingTrigger?: {
     controllerId: string;
@@ -271,6 +307,35 @@ export type Step =
   | 'endStep'
   | 'cleanup';
 
+/** Arena-like phase stops (PromptController). */
+export type StopKey =
+  | 'upkeep'
+  | 'draw'
+  | 'beginCombat'
+  | 'declareAttackers'
+  | 'declareBlockers'
+  | 'combatDamage'
+  | 'endCombat'
+  | 'endStep'
+  | 'oppUpkeep'
+  | 'oppDraw'
+  | 'oppBeginCombat'
+  | 'oppDeclareAttackers'
+  | 'oppDeclareBlockers'
+  | 'oppCombatDamage'
+  | 'oppEndStep';
+
+/** Per-player Arena clock / stop settings. */
+export type PlayerClock = {
+  stops: StopKey[];
+  /** Ctrl / Full Control — never auto-yield. */
+  fullControl: boolean;
+  /** Keep priority after next action once (Arena temporary Full Control). */
+  holdPriorityOnce: boolean;
+  /** Enter / Shift+Enter style pass-turn. */
+  passTurnMode: 'off' | 'untilResponse' | 'unconditional';
+};
+
 /** Stashed cast/activate waiting on Ward payment. */
 export type WardResume = {
   kind: 'spell' | 'ability';
@@ -287,7 +352,8 @@ export type WardResume = {
     | 'blitz'
     | 'spectacle'
     | 'evoke'
-    | 'overload';
+    | 'overload'
+    | 'cascade';
   targets: Record<string, TargetRef>;
   script: SpellScript;
 };
@@ -357,6 +423,28 @@ export type PendingChoice =
       amount: number;
     }
   | {
+      /** Devour N — choose any number of other creatures to sac (702.81). */
+      type: 'devour';
+      playerId: string;
+      permanentId: string;
+      devourN: number;
+    }
+  | {
+      /** Optional "You may …" effect (MVP: single effect batch). */
+      type: 'optionalEffect';
+      playerId: string;
+      label: string;
+      script: SpellScript;
+      sourcePermanentId?: string;
+    }
+  | {
+      /** Siege ETB — choose which opponent protects the battle (310.12a). */
+      type: 'chooseBattleProtector';
+      playerId: string;
+      battleId: string;
+      opponentIds: string[];
+    }
+  | {
       /** CR 603.3b — order simultaneous triggers you control. */
       type: 'orderTriggers';
       playerId: string;
@@ -376,6 +464,8 @@ export interface GameState {
   turnNumber: number;
   stateBasedActionsPending: boolean;
   pendingChoices: PendingChoice[];
+  /** Arena PromptController — stops / Full Control / pass-turn per player. */
+  playerClocks: Record<string, PlayerClock>;
   /** Winner player id when only one remains (multiplayer), or null. */
   winnerId: string | null;
   /** In-progress cast targeting (Arena GRE-style prompt). */
@@ -401,6 +491,10 @@ export interface GameState {
   creaturesDiedThisTurn?: number;
   /** Spells cast this turn (storm count; current spell not yet counted when checked). */
   spellsCastThisTurn: number;
+  /** Spells cast by previous turn's active player (732.2 day/night check). */
+  spellsCastPreviousTurn?: number;
+  /** Day / night designation (732) — null = neither. */
+  dayNight?: 'day' | 'night' | null;
   /** Active prevention shields (615). */
   preventionShields: PreventionShield[];
   /** Damage redirect shields (614 MVP). */
@@ -441,6 +535,8 @@ export type AttackerDecl = {
   defendingPlayerId: string;
   /** If set, attacking a planeswalker controlled by defendingPlayerId. */
   defendingPlaneswalkerId?: string | null;
+  /** If set, attacking a battle (protector = defendingPlayerId). */
+  defendingBattleId?: string | null;
   /** Blocker creature ids (order = damage assignment order MVP). */
   blockers: string[];
 };
@@ -464,12 +560,26 @@ export type CombatState = {
   mode: 'idle' | 'declareAttackers' | 'declareBlockers' | 'assignDamage' | null;
   /** Draft selection before Confirm. */
   draftAttackerIds: string[];
+  /**
+   * Per-attacker defend target (Arena: drag each attacker to face / PW).
+   * Falls back to global draftDefend* when missing.
+   */
+  draftAttackTargets: Record<
+    string,
+    {
+      defendingPlayerId: string;
+      defendingPlaneswalkerId?: string | null;
+      defendingBattleId?: string | null;
+    }
+  >;
   /** defender assigns: attackerId → blockerIds */
   draftBlocks: Record<string, string[]>;
-  /** Default defend target when declaring attacks (multiplayer). */
+  /** Default / brush defend target when declaring attacks. */
   draftDefendPlayerId: string | null;
   /** Optional planeswalker under draftDefendPlayerId being attacked. */
   draftDefendPlaneswalkerId: string | null;
+  /** Optional battle being attacked (Siege: may be controlled by attacker). */
+  draftDefendBattleId: string | null;
   /** Blocker UI: which attacker is focused (Arena-like). */
   focusAttackerId: string | null;
   /**
@@ -502,6 +612,14 @@ export function isPlaneswalker(x: CardData | CardInstance): boolean {
   return typeLineOf(x).includes('Planeswalker');
 }
 
+export function isBattle(x: CardData | CardInstance): boolean {
+  return typeLineOf(x).includes('Battle');
+}
+
+export function isSiege(x: CardData | CardInstance): boolean {
+  return /\bsiege\b/i.test(typeLineOf(x));
+}
+
 export function isLegendary(x: CardData | CardInstance): boolean {
   return typeLineOf(x).includes('Legendary');
 }
@@ -515,6 +633,12 @@ export function parseToughness(card: CardData): number | null {
 export function parseLoyalty(card: CardData): number | null {
   if (card.loyalty == null || card.loyalty === '') return null;
   const n = parseInt(card.loyalty, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+export function parseDefense(card: CardData): number | null {
+  if (card.defense == null || card.defense === '') return null;
+  const n = parseInt(card.defense, 10);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -550,11 +674,14 @@ export function effectivePower(c: CardInstance, state?: GameState): number {
   const minus = c.counters['-1/-1'] || 0;
   const att = attachmentPtBonus(c, state);
   const cont = state ? continuousPtBonus(c, state) : { power: 0, toughness: 0 };
-  return (parsePower(c.card) ?? 0) + (c.tempPower || 0) + plus - minus + att.power + cont.power;
+  const set = state ? continuousSetPt(c, state) : null;
+  const printed = set ? set.power : (parsePower(c.card) ?? 0);
+  return printed + (c.tempPower || 0) + plus - minus + att.power + cont.power;
 }
 
 export function effectiveToughness(c: CardInstance, state?: GameState): number | null {
-  const base = parseToughness(c.card);
+  const set = state ? continuousSetPt(c, state) : null;
+  const base = set ? set.toughness : parseToughness(c.card);
   if (base === null) return null;
   const plus = c.counters['+1/+1'] || 0;
   const minus = c.counters['-1/-1'] || 0;
@@ -580,9 +707,11 @@ export function emptyCombat(): CombatState {
     declaringPlayerId: null,
     mode: null,
     draftAttackerIds: [],
+    draftAttackTargets: {},
     draftBlocks: {},
     draftDefendPlayerId: null,
     draftDefendPlaneswalkerId: null,
+    draftDefendBattleId: null,
     focusAttackerId: null,
     damageWave: null,
     assignedFirstWave: [],

@@ -3,6 +3,7 @@
  * Each player: decide keep / mulligan; on keep after N mulligans, put N on bottom.
  */
 import { GameState } from './types';
+import { beginFirstTurnAfterMulligans } from './turn';
 import { clonePlayers } from './zones';
 
 function shuffleInPlace<T>(arr: T[]): void {
@@ -47,8 +48,9 @@ export function resolveMulliganKeep(state: GameState, playerId: string): GameSta
       mulligansTaken: taken,
       phase: 'bottom',
     });
+    return next;
   }
-  return next;
+  return beginFirstTurnAfterMulligans(next);
 }
 
 /** Take another mulligan: shuffle hand into library, draw 7. */
@@ -115,7 +117,7 @@ export function resolveMulliganBottom(state: GameState, playerId: string, bottom
   p.library.push(...moving);
 
   next.pendingChoices = next.pendingChoices.filter((c) => c !== choice);
-  return next;
+  return beginFirstTurnAfterMulligans(next);
 }
 
 export function hasOpenMulligans(state: GameState): boolean {

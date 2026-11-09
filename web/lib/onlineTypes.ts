@@ -37,7 +37,22 @@ export type RoomAction =
   | { type: 'toggleDelveCard'; cardId: string }
   | { type: 'confirmConvokeDelve' }
   | { type: 'cancelCast' }
+  | { type: 'confirmCastPay' }
+  | { type: 'setPreferPhyrexianLife'; prefer: boolean }
+  | { type: 'setHybridPick'; index: number; color: import('./engine').ManaColor }
+  | { type: 'toggleCostDiscard'; cardId: string }
+  | { type: 'toggleCostSacrifice'; permanentId: string }
+  | { type: 'confirmAdditionalCost' }
+  | {
+      type: 'setAttackerDefendTarget';
+      attackerId: string;
+      defendingPlayerId: string;
+      defendingPlaneswalkerId?: string | null;
+      defendingBattleId?: string | null;
+    }
+  | { type: 'dropBlockerOnAttacker'; attackerId: string; blockerId: string }
   | { type: 'activateMana'; cardId: string }
+  | { type: 'autoTapForPending' }
   | { type: 'beginActivate'; cardId: string }
   | { type: 'toggleDraftAttacker'; creatureId: string }
   | { type: 'setDefendPlayer'; defendingPlayerId: string }
@@ -71,4 +86,15 @@ export type RoomAction =
   | { type: 'resolveDiscardSelect'; cardIds: string[] }
   | { type: 'resolveRiot'; permanentId: string; choice: 'haste' | 'counter' }
   | { type: 'resolveSacrificePermanents'; permanentIds: string[] }
+  | { type: 'resolveDevour'; creatureIds: string[] }
+  | { type: 'resolveOptionalEffect'; take: boolean }
+  | { type: 'resolveBattleProtector'; opponentId: string }
+  | { type: 'confirmEscapeExile' }
+  | { type: 'toggleEscapeExile'; cardId: string }
+  | { type: 'setDefendBattle'; battleId: string | null }
+  | { type: 'toggleStop'; key: import('./engine').StopKey }
+  | { type: 'setFullControl'; on: boolean }
+  | { type: 'armHoldPriority' }
+  | { type: 'clearHoldPriority' }
+  | { type: 'setPassTurnMode'; mode: 'off' | 'untilResponse' | 'unconditional' }
   | { type: 'moveDraftBlocker'; attackerId: string; blockerId: string; direction: -1 | 1 };

@@ -7,6 +7,7 @@ export type TargetFilter =
   | 'creature'
   | 'creatureYouControl'
   | 'creatureCardInYourGy'
+  | 'cardInYourGy'
   | 'cardInAnyGy'
   | 'player'
   | 'permanent'
@@ -40,6 +41,14 @@ export type Effect =
   | { type: 'addCounter'; targetKey: string; counter: string; amount: number }
   | { type: 'fight'; aKey: string; bKey: string }
   | { type: 'searchBasicLand'; tapped: boolean }
+  /** Search library; put into hand (Demonic Tutor / typed tutors). */
+  | { type: 'searchLibraryHand'; cardType?: 'creature' | 'instant' | 'sorcery' | 'artifact' | 'enchantment' }
+  /** Search library; put on top (Worldly / Mystical / Enlightened / Vampiric). */
+  | { type: 'searchLibraryTop'; cardType?: 'creature' | 'instant' | 'sorcery' | 'artifact' | 'enchantment' }
+  /** Exile top N; you may play them this turn (Reckless Impulse). */
+  | { type: 'exileTopMayPlay'; amount: number }
+  /** Dockside — Treasure per artifact/enchantment opponents control. */
+  | { type: 'createTreasurePerOppArtifactsEnchantments' }
   | { type: 'scry'; amount: number }
   | { type: 'surveil'; amount: number }
   | { type: 'loot'; draw: number; discard: number }
@@ -112,6 +121,8 @@ export type Effect =
   | { type: 'damageEqualDomain'; targetKey: string }
   | { type: 'drawEqualDomain' }
   | { type: 'explore'; targetKey?: string }
+  | { type: 'becomeDay' }
+  | { type: 'becomeNight' }
   | { type: 'fabricate'; amount: number }
   | { type: 'support'; amount: number }
   | { type: 'bolster'; amount: number }
@@ -128,6 +139,9 @@ export type Effect =
   | { type: 'discardEachOpponent'; amount: number }
   | { type: 'addCounterAllYouControl'; counter: string; amount: number }
   | { type: 'drawEqualDiedThisTurn' }
+  | { type: 'forceSacrifice'; playerId: string; amount: number }
+  | { type: 'optional'; label: string; effects: Effect[] }
+  | { type: 'transform'; targetKey?: string }
   | { type: 'noop' };
 
 /** One mode of a modal spell ("Choose one —"). */
@@ -240,6 +254,24 @@ function parseEffectsFromText(
   opts: { allowTargets: boolean },
 ): void {
   if (!text) return;
+
+  // "You may …" → optional wrapper (ETB clauses often lack a trailing period)
+  const mayM = text.match(/\byou\s+may\s+([^.]+?)(?:\.|$)/i);
+  if (mayM && !/\bunless\b/i.test(text)) {
+    const nested: Effect[] = [];
+    const nestedTargets: TargetSlot[] = [];
+    parseEffectsFromText(mayM[1], nestedTargets, nested, opts);
+    if (nested.length > 0 && !nested.every((e) => e.type === 'noop')) {
+      for (const t of nestedTargets) targets.push(t);
+      effects.push({
+        type: 'optional',
+        label: mayM[1].trim(),
+        effects: nested,
+      });
+      // Strip the may clause; continue parsing remainder
+      text = text.replace(mayM[0], ' ');
+    }
+  }
 
   // Peel delayed clauses so nested effects are not also immediate.
   const delayed: { when: 'endStep' | 'endCombat'; clause: string }[] = [];
@@ -444,6 +476,64 @@ function parseEffectsFromText(
     });
   }
 
+  // Demonic Tutor — any card to hand
+  if (
+    /search\s+your\s+library\s+for\s+a\s+card(?!\s+with)/i.test(text) &&
+    /put\s+that\s+card\s+into\s+your\s+hand/i.test(text)
+  ) {
+    effects.push({ type: 'searchLibraryHand' });
+  }
+
+  // Typed tutors → hand or top (Worldly / Mystical / Enlightened / Idyllic)
+  {
+    const typed = text.match(
+      /search\s+your\s+library\s+for\s+(?:an?\s+)?(creature|instant|sorcery|artifact|enchantment)(?:\s+or\s+(?:an?\s+)?(?:creature|instant|sorcery|artifact|enchantment))?\s+card/i,
+    );
+    if (typed) {
+      const cardType = typed[1].toLowerCase() as
+        | 'creature'
+        | 'instant'
+        | 'sorcery'
+        | 'artifact'
+        | 'enchantment';
+      if (/into\s+your\s+hand/i.test(text)) {
+        effects.push({ type: 'searchLibraryHand', cardType });
+      } else if (/on\s+top/i.test(text)) {
+        effects.push({ type: 'searchLibraryTop', cardType });
+      }
+    } else if (
+      /search\s+your\s+library\s+for\s+a\s+card(?!\s+with)/i.test(text) &&
+      /on\s+top/i.test(text)
+    ) {
+      effects.push({ type: 'searchLibraryTop' });
+    }
+  }
+
+  // Reckless Impulse / Light Up the Stage
+  {
+    const exileTop = text.match(
+      /exile\s+the\s+top\s+(one|two|three|\d+)\s+cards?\s+of\s+your\s+library/i,
+    );
+    if (exileTop && /may\s+play/i.test(text)) {
+      effects.push({ type: 'exileTopMayPlay', amount: parseCount(exileTop[1]) });
+    }
+  }
+
+  // Dockside Extortionist ETB (X = opp artifacts + enchantments)
+  if (
+    /create\s+(?:a\s+treasure\s+token\s+for\s+each\s+artifact\s+and\s+enchantment\s+your\s+opponents\s+control|x\s+treasure\s+tokens?,?\s+where\s+x\s+is\s+the\s+number\s+of\s+artifacts?\s+and\s+enchantments?\s+your\s+opponents\s+control)/i.test(
+      text,
+    )
+  ) {
+    effects.push({ type: 'createTreasurePerOppArtifactsEnchantments' });
+  }
+
+  // You lose N life (Vampiric Tutor etc.)
+  {
+    const youLose = text.match(/(?:^|[.]\s*)you\s+lose\s+(\d+)\s+life/i);
+    if (youLose) effects.push({ type: 'loseLife', amount: parseInt(youLose[1], 10) });
+  }
+
   const scry = text.match(/\bscry\s+(\d+)\b/i);
   if (scry) effects.push({ type: 'scry', amount: parseInt(scry[1], 10) });
 
@@ -462,6 +552,17 @@ function parseEffectsFromText(
     )
   ) {
     const key = addTarget(targets, 'creatureCardInYourGy', 'Choose creature card in your GY');
+    effects.push({ type: 'returnToHand', targetKey: key });
+  }
+
+  // Regrowth / Eternal Witness — any card from your GY
+  if (
+    opts.allowTargets &&
+    /return\s+target\s+card\s+from\s+(?:your|a)\s+graveyard\s+to\s+(?:your|its\s+owner'?s?)\s+hand/i.test(
+      text,
+    )
+  ) {
+    const key = addTarget(targets, 'cardInYourGy', 'Choose card in your GY');
     effects.push({ type: 'returnToHand', targetKey: key });
   }
 
@@ -585,10 +686,26 @@ function parseEffectsFromText(
       const key = addTarget(targets, 'creature', 'Choose creature to regenerate');
       effects.push({ type: 'regenerate', targetKey: key });
     }
-    if (/copy\s+target\s+(?:instant|sorcery\s+)?spell/i.test(text)) {
+    if (
+      /copy\s+target\s+(?:instant\s+or\s+sorcery\s+|instant\s+|sorcery\s+)?spell/i.test(text)
+    ) {
       const key = addTarget(targets, 'spell', 'Choose spell to copy');
       effects.push({ type: 'copySpell', targetKey: key });
     }
+    if (/transform\s+target\s+(?:creature|permanent)/i.test(text)) {
+      const key = addTarget(targets, 'permanent', 'Choose permanent to transform');
+      effects.push({ type: 'transform', targetKey: key });
+    }
+  }
+
+  // "Transform ~" / "Transform CARDNAME" / "transform it" (self)
+  if (
+    /transform\s+(?:~|it|this\s+(?:creature|permanent)|[A-Z][\w']*(?:\s+[A-Z][\w']*)*)\b/i.test(
+      text,
+    ) &&
+    !/transform\s+target/i.test(text)
+  ) {
+    effects.push({ type: 'transform' });
   }
 
   if (/destroy\s+all\s+artifacts/i.test(text)) {
@@ -848,6 +965,13 @@ function parseEffectsFromText(
     }
   }
 
+  if (/\bit becomes day\b|\bbecomes day\b/i.test(text) && !/daybound/i.test(text)) {
+    effects.push({ type: 'becomeDay' });
+  }
+  if (/\bit becomes night\b|\bbecomes night\b/i.test(text) && !/nightbound/i.test(text)) {
+    effects.push({ type: 'becomeNight' });
+  }
+
   const fabricate = text.match(/\bfabricate\s+(\d+)\b/i);
   if (fabricate) effects.push({ type: 'fabricate', amount: parseInt(fabricate[1], 10) });
 
@@ -912,6 +1036,16 @@ function parseEffectsFromText(
     )
   ) {
     const key = addTarget(targets, 'creatureCardInYourGy', 'Choose creature card in your GY');
+    effects.push({ type: 'returnToHand', targetKey: key });
+  }
+
+  if (
+    opts.allowTargets &&
+    /return\s+target\s+card\s+from\s+(?:your|a)\s+graveyard\s+to\s+(?:your|its\s+owner'?s)\s+hand/i.test(
+      text,
+    )
+  ) {
+    const key = addTarget(targets, 'cardInYourGy', 'Choose card in your GY');
     effects.push({ type: 'returnToHand', targetKey: key });
   }
 
@@ -1115,7 +1249,9 @@ export function continuousGrantedKeywords(
         id: string;
         controller: string;
         attachedTo?: string;
-        card: { oracle_text?: string };
+        classLevel?: number;
+        solved?: boolean;
+        card: { oracle_text?: string; type_line?: string };
       }[];
     }[];
   },
@@ -1136,10 +1272,12 @@ export function continuousGrantedKeywords(
     'first strike',
     'double strike',
   ];
+  // Lazy import avoids cycle with classCase → effects
+  const { activeOracleText } = require('./classCase') as typeof import('./classCase');
   for (const p of state.players) {
     for (const src of p.battlefield) {
       if (src.id === permanent.id) continue;
-      const text = src.card.oracle_text || '';
+      const text = activeOracleText(src);
       for (const kw of kwList) {
         const reYou = new RegExp(
           `creatures\\s+you\\s+control\\s+have\\s+${kw.replace(' ', '\\s+')}`,
@@ -1526,6 +1664,103 @@ export function isSaga(card: { type_line?: string }): boolean {
   return /enchantment\s+—\s*saga/i.test(card.type_line || '') || /\bsaga\b/i.test(card.type_line || '');
 }
 
+export function isClass(card: { type_line?: string }): boolean {
+  return /enchantment\s+—\s*class/i.test(card.type_line || '') || /\bclass\b/i.test(card.type_line || '');
+}
+
+export function isCase(card: { type_line?: string }): boolean {
+  return /enchantment\s+—\s*case/i.test(card.type_line || '') || /\bcase\b/i.test(card.type_line || '');
+}
+
+export function hasDaybound(card: {
+  oracle_text?: string;
+  keywords?: string[];
+}): boolean {
+  if ((card.keywords || []).some((k) => k.toLowerCase() === 'daybound')) return true;
+  return /\bdaybound\b/i.test(card.oracle_text || '');
+}
+
+export function hasNightbound(card: {
+  oracle_text?: string;
+  keywords?: string[];
+}): boolean {
+  if ((card.keywords || []).some((k) => k.toLowerCase() === 'nightbound')) return true;
+  return /\bnightbound\b/i.test(card.oracle_text || '');
+}
+
+export type ClassLevelSection = {
+  /** 1 = always-on top section; 2+ = unlocked by level-up. */
+  level: number;
+  /** Mana cost to reach this level (absent for level 1). */
+  cost?: string;
+  text: string;
+};
+
+/**
+ * Split Class oracle into level sections (717).
+ * Supports `{2}{G}: Level 2` then following lines, or `{2}: Level 2 — abilities`.
+ */
+export function parseClassLevels(oracleText?: string): ClassLevelSection[] {
+  if (!oracleText) return [];
+  const lines = oracleText.split(/\n/).map((l) => l.trim()).filter(Boolean);
+  const sections: ClassLevelSection[] = [];
+  let cur: ClassLevelSection = { level: 1, text: '' };
+  const levelRe = /^((?:\{[^}]+\})+)\s*:\s*Level\s+(\d+)(?:\s*[—–-]\s*(.*))?$/i;
+
+  for (const line of lines) {
+    if (/^\(Gain the next level/i.test(line)) continue;
+    const m = line.match(levelRe);
+    if (m) {
+      if (cur.text.trim()) sections.push({ ...cur, text: cur.text.trim() });
+      cur = {
+        level: parseInt(m[2], 10),
+        cost: m[1].replace(/\s+/g, ''),
+        text: (m[3] || '').trim(),
+      };
+      continue;
+    }
+    cur.text = cur.text ? `${cur.text}\n${line}` : line;
+  }
+  if (cur.text.trim() || cur.level === 1) {
+    sections.push({ ...cur, text: cur.text.trim() });
+  }
+  // Ensure level 1 exists
+  if (!sections.some((s) => s.level === 1)) {
+    sections.unshift({ level: 1, text: '' });
+  }
+  return sections.sort((a, b) => a.level - b.level);
+}
+
+export type CaseParts = {
+  alwaysText: string;
+  toSolve: string | null;
+  solvedText: string | null;
+};
+
+/** Split Case oracle into always / To solve / Solved (720). */
+export function parseCaseParts(oracleText?: string): CaseParts | null {
+  if (!oracleText) return null;
+  const toSolveM = oracleText.match(
+    /To solve\s*[—–-]\s*([^\n]+)/i,
+  );
+  const solvedM = oracleText.match(
+    /Solved\s*[—–-]\s*([\s\S]+)$/i,
+  );
+  let always = oracleText;
+  if (toSolveM) {
+    always = always.slice(0, toSolveM.index).trim();
+  } else if (solvedM) {
+    always = always.slice(0, solvedM.index).trim();
+  }
+  // Drop reminder / "To solve" block from always if Solved came first somehow
+  always = always.replace(/To solve\s*[—–-][\s\S]*/i, '').trim();
+  return {
+    alwaysText: always,
+    toSolve: toSolveM ? toSolveM[1].trim() : null,
+    solvedText: solvedM ? solvedM[1].trim() : null,
+  };
+}
+
 /** Escape — cost + exile N other cards from GY. */
 export function parseEscape(
   oracleText?: string,
@@ -1777,16 +2012,27 @@ export function cardParseCoverage(card: {
       text,
     ) &&
     (/^[A-Za-z][A-Za-z\s,/]*(?:\(.+\))?$/m.test(text.split('\n')[0] || '') ||
-      /\b(equip|crew|cycling|flashback|unearth|escape|embalm|modular|evolve|undying|persist|mentor|exalted|prowess|training|bloodthirst|renown|adapt|monstrosity)\b/i.test(
+      /\b(equip|crew|cycling|flashback|unearth|escape|embalm|modular|evolve|undying|persist|mentor|exalted|prowess|training|bloodthirst|renown|adapt|monstrosity|annihilator|afterlife|toxic|dash|blitz|devour|ward|unblockable|indestructible|hexproof|shroud|menace|trample|flying|haste|vigilance|lifelink|deathtouch|defender|reach|first strike|double strike)\b/i.test(
         text,
       ));
+  const staticOk =
+    /\bcan't be blocked\b/i.test(text) ||
+    /\bcan't block\b/i.test(text) ||
+    /\benters(?: the battlefield)? with\b/i.test(text) ||
+    /\bcreatures you control have\b/i.test(text) ||
+    /\b(?:\w+\s+)?creatures you control get\b/i.test(text) ||
+    /\bif a card would be put into (?:a |any )?graveyard/i.test(text) ||
+    /\{T\}:\s*Add\b/i.test(text) ||
+    /\{T\}:/i.test(text) ||
+    /\bescape\b/i.test(text) ||
+    /\bbattle\b/i.test(tl) ||
+    /\bsiege\b/i.test(tl);
   const ok =
     cast ||
     etb ||
     dies ||
     keywordOnly ||
-    /\b\{T\}:\s*Add\b/i.test(text) ||
-    /\b\{T\}:/i.test(text);
+    staticOk;
   return { ok, cast, etb, dies, land: false };
 }
 

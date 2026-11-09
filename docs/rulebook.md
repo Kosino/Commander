@@ -128,12 +128,15 @@ Pořadí = priorita pro hratelnost. Každý balík = jeden workstream.
 
 - [x] **P1 Arena DnD UX** — drag&drop: hand→cast/land, BF→attack/block/target, click fallback; drop zóny na stole.
 - [x] **P2 Commander setup** — London mulligan; commander relocate hand/library; Partner + Companion.
-- [x] **P3 Combat & stack UX** — ruční damage assign / trample split; stack jako karty; PW loyalty výběr. (arrows/lanes polish later)
+- [x] **P3 Combat & stack UX** — ruční damage assign / trample split; stack jako karty; PW loyalty výběr.
 - [x] **P4 Oracle coverage wave** — nové patterny (opp lose/discard, counters all, GY return, grant KW, tokens); `npm run oracle-coverage`.
 - [x] **P5 Abilities deep** — PW +/−/0 výběr; víc non-tap aktivací; trigger order (APNAP).
 - [x] **P6 Continuous & replacement** — víc CR 613 vrstev; obecnější „if would…“ replacement.
 - [x] **P7 Multiplayer scale** — 3–4 seats EDH; lobby + early start; presence `lastSeen`; Redis via `REDIS_URL` (file fallback).
 - [x] **P8 Deck & polish** — banlist/Game Changers; auto-pass; `smoke-flow`; Scryfall art + zoom.
+- [x] **P9 Arena PromptController + online parity** — stops / Full Control / Hold / pass-turn / PhaseRail; shared `CombatPromptPanel` (blocker order + damage assign); online mana-during-cast; 3–4P lobby seats; keyboard Space/Enter/Shift+Enter.
+- [x] **P10 Combat arrows & lanes** — SVG attack/block/draft arrows over Arena felt; defend-lane seat highlight; card combat roles; works with 3–4P seat ring.
+- [x] **P11 Class / Case / DayNight** — Class levels (717) + sorcery level-up; Case to-solve/solved (720); day/night designation + daybound/nightbound (732 / 702.145). Adventure/meld/mutate later.
 
 ---
 

@@ -10,6 +10,8 @@ export function playLand(state: GameState, playerId: string, cardId: string): Ga
   const player = state.players.find((p) => p.id === playerId);
   if (!player || player.hasLost) return state;
   if (state.players[state.priorityPlayerIndex]?.id !== playerId) return state;
+  // CR 305.2 / Arena — only active player plays a land
+  if (state.players[state.activePlayerIndex]?.id !== playerId) return state;
 
   const card = player.hand.find((c) => c.id === cardId);
   if (!card || !card.card.type_line.includes('Land')) return state;

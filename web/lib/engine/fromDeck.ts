@@ -21,10 +21,13 @@ export function cardToCardData(card: Card): CardData {
     oracle_text: card.oracle_text,
     power: card.power,
     toughness: card.toughness,
+    loyalty: card.loyalty,
+    defense: card.defense,
     colors: identity.filter((c) => c !== 'C'),
     color_identity: identity,
     keywords: card.keywords || [],
     image_uri: card.image_uri,
+    other_face: card.other_face ? cardToCardData(card.other_face) : undefined,
   };
 }
 
